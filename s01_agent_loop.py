@@ -1,33 +1,52 @@
 import os
 import subprocess
 
-from anthropic import Anthropic
+# from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-print(os.getenv("ANTHROPIC_API_KEY"))
 
 # if os.getenv("LLM_BASE_URL"):
 #     os.environ.pop("ANTHROPIC_API_KEY", None)
 
-client = Anthropic(base_url=os.getenv("LLM_BASE_URL"))
-print(os.getenv("ANTHROPIC_API_KEY"))
+client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=os.getenv("NVIDIA_API_KEY"),
+)
+print(os.getenv("NVIDIA_API_KEY"))
 
 print(client)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-TOOLS = [{
-    "name": "bash",
-    "description": "Run a shell command.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
-    },
-}]
+# TOOLS = [{
+#     "name": "bash",
+#     "description": "Run a shell command.",
+#     "input_schema": {
+#         "type": "object",
+#         "properties": {"command": {"type": "string"}},
+#         "required": ["command"],
+#     },
+# }]
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"],
+            },
+        },
+    }
+]
 
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -45,25 +64,56 @@ def run_bash(command: str) -> str:
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM},
+                *messages
+            ],
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=2000,
         )
+        
         # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
+        msg = response.choices[0].message
+
+        print("=== OUTPUT ===")
+        print(msg.content)
+
+        if msg.tool_calls:
+            print("=== TOOL CALL ===")
+            print(msg.tool_calls)
+
+        print("=== TOKENS ===")
+        print(response.usage)
+        
+        messages.append({
+            "role": "assistant",
+            "tool_calls": msg.tool_calls,
+            "content": []
+        })
         # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        if not msg.tool_calls:
+            # print(msg.content)
             return
         # Execute each tool call, collect results
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
+        tool_results = []
+        for call in msg.tool_calls:
+            func_name = call.function.name
+            args = eval(call.function.arguments)
+
+            if func_name == "bash":
+                print(f"\033[33m$ {args['command']}\033[0m")
+                output = run_bash(args["command"])
+                print(output[:-1])
+
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": str(output)
+                })
+        messages.extend(tool_results)
 
 
 if __name__ == "__main__":
