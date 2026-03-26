@@ -40,21 +40,23 @@ TOOL_HANDLERS = {
 }
 
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Run a shell command.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"}
-                },
-                "required": ["command"],
-            },
-        },
-    }
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}}
 ]
+
+TOOLS2 = [
+    {"name": "bash", "description": "Run a shell command.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Write content to file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+]
+
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -147,16 +149,15 @@ def agent_loop(messages: list):
             func_name = call.function.name
             args = eval(call.function.arguments)
 
-            if func_name == "bash":
-                print(f"\033[33m$ {args['command']}\033[0m")
-                output = run_bash(args["command"])
-                print(output[:-1])
+            handler = TOOL_HANDLERS.get(func_name)
+            output = handler(**args) if handler else f"Unknown tool: {block.name}"
+            print(output[:500])
 
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": str(output)
-                })
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": str(output)
+            })
         messages.extend(tool_results)
 
 
