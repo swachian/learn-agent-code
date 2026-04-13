@@ -26,3 +26,12 @@ Use the todo tool to plan multi-step tasks. Mark in_progress before starting, co
 Prefer tools over prose."""
 ```
 
+得到任务分解和结果都是类似`{'id': '1', 'text': 'Read and summarize main.py', 'status': 'completed'}`的结构。
+如果你要求她必须先列出计划，就要和她明确这个要求。
+
+
+s04
+
+这个没什么好说的，就是一个类似fork,交给subagent去做
+
+

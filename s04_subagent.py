@@ -20,61 +20,11 @@ print(os.getenv("NVIDIA_API_KEY"))
 WORKDIR = Path.cwd()
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"""
-You are a coding agent at {WORKDIR}.
 
-STRICT RULES:
 
-1. When creating a todo list for the FIRST time:
-   - ALL items MUST be "pending"
-   - DO NOT mark anything as "completed"
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
-2. Only mark a task as "in_progress" when you are about to execute it
-
-3. Only mark a task as "completed" AFTER you have executed the required tools
-
-4. NEVER assume a task is completed without running tools
-
-Use the todo tool to plan and track progress.
-
-Prefer tools over prose.
-"""
-
-# -- TodoManager: structured state the LLM writes to --
-class TodoManager:
-    def __init__(self):
-        self.items = []
-    def update(self, items: list) -> str:
-        if len(items) > 20:
-            raise ValueError("Max 20 todos allowed")
-        validated = []
-        in_progress_count = 0
-        for i, item in enumerate(items):
-            text = str(item.get("text", "")).strip()
-            status = str(item.get("status", "pending")).lower()
-            item_id = str(item.get("id", str(i + 1)))
-            if not text:
-                raise ValueError(f"Item {item_id}: text required")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"Item {item_id}: invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress at a time")
-        self.items = validated
-        return self.render()
-    def render(self) -> str:
-        if not self.items:
-            return "No todos."
-        lines = []
-        for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
-        done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
-TODO = TodoManager()
 
 # -- The dispatch map: {tool_name: handler} --
 TOOL_HANDLERS = {
@@ -82,18 +32,16 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
-TOOLS = [
+CHILD_TOOLS = [
     {"type": "function", "function": {"name": "bash", "description": "Run a shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
     {"type": "function", "function": {"name": "read_file", "description": "Read file contents.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
     {"type": "function", "function": {"name": "write_file", "description": "Write content to file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
-    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
-    {"type": "function", "function": {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.", "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}}}
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}}
 ]
-# TOOLS_TODO = [
 
+PARENT_TOOLS = CHILD_TOOLS + [{"type": "function", "function": {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}}}]
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -143,33 +91,68 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
     
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+
+    for _ in range(30):  # safety limit
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SUBAGENT_SYSTEM},
+                *sub_messages
+            ],
+            tools=CHILD_TOOLS,
+            tool_choice="auto",
+            max_tokens=2000,
+        )
+
+        msg = response.choices[0].message
+
+        # ✅ 记录 assistant（必须带 tool_calls）
+        sub_messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": msg.tool_calls
+        })
+
+        # ❌ 没有工具调用 → 结束
+        if not msg.tool_calls:
+            break
+
+        tool_results = []
+
+        # ✅ 执行工具
+        for call in msg.tool_calls:
+            func_name = call.function.name
+            args = eval(call.function.arguments)
+
+            handler = TOOL_HANDLERS.get(func_name)
+            output = handler(**args) if handler else f"Unknown tool: {func_name}"
+
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": str(output)[:50000]
+            })
+
+        # ✅ 把 tool 结果喂回去
+        sub_messages.extend(tool_results)
+
+    # ✅ 返回最终文本（OpenAI是 msg.content）
+    return msg.content or "(no summary)"
+    
 
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
-    rounds_since_todo = 0
     while True:
-        # Nag reminder: if 3+ rounds without a todo update, inject reminder
-        if rounds_since_todo >= 3 and messages:
-            last = messages[-1]
-            if last["role"] == "user":
-                # ✅ 如果是字符串，先转成 OpenAI 标准结构
-                if isinstance(last.get("content"), str):
-                    last["content"] = [{"type": "text", "text": last["content"]}]
-
-                # ✅ 再插入 reminder
-                if isinstance(last.get("content"), list):
-                    last["content"].insert(0, {
-                        "type": "text",
-                        "text": "<reminder>Update your todos.</reminder>"
-                    })
-                    
         response = client.chat.completions.create(
             model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM},
                 *messages
             ],
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             tool_choice="auto",
             max_tokens=2000,
         )
@@ -198,23 +181,25 @@ def agent_loop(messages: list):
             return
         # Execute each tool call, collect results
         tool_results = []
-        used_todo = False
         for call in msg.tool_calls:
             func_name = call.function.name
             args = eval(call.function.arguments)
 
-            handler = TOOL_HANDLERS.get(func_name)
-            output = handler(**args) if handler else f"Unknown tool: {block.name}"
-            print(f"> {func_name}: {output[:500]}")
+            if func_name == "task":
+                desc = args.get("description", "subtask")
+                print(f"> task ({desc}): {args['prompt'][:80]}")
+                output = run_subagent(args["prompt"])
+            else:
+                handler = TOOL_HANDLERS.get(func_name)
+                output = handler(**args) if handler else f"Unknown tool: {func_name}"
+
+            print(f"  {str(output)[:200]}")
 
             tool_results.append({
                 "role": "tool",
                 "tool_call_id": call.id,
                 "content": str(output)
             })
-            if func_name == "todo":
-                used_todo = True
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         messages.extend(tool_results)
 
 
@@ -235,6 +220,3 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
-
-# test case:        
-# Refactor the file hello.py: add type hints, docstrings, and a main guard 
