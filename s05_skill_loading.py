@@ -2,17 +2,15 @@ import os
 import re
 import json
 import subprocess
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-# from anthropic import Anthropic
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# if os.getenv("LLM_BASE_URL"):
-#     os.environ.pop("ANTHROPIC_API_KEY", None)
 
 client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
@@ -100,13 +98,15 @@ Skills available:
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
+        raise ValueError("Access denied")
     return path
 
 def run_bash(command: str) -> str:
-    import shlex
     # Block dangerous patterns more comprehensively
     dangerous_patterns = [';', '&&', '||', '|', '>', '<', '`', '$', 'sudo']
+    for pattern in dangerous_patterns:
+        if pattern in command:
+            raise ValueError(f"Dangerous character/pattern '{pattern}' detected in command")
     if os.name != 'nt':  # Unix-like
         # Safer: don't use shell=True for user input
         try:
@@ -238,7 +238,7 @@ TOOL_HANDLERS = {
  
     
 def extract_text(message) -> str:
-    # OpenAI: message.content 是字符串
+    # OpenAI: message.content 
     return message.content.strip() if message.content else ""
 
 
@@ -258,7 +258,7 @@ def agent_loop(messages: list) -> None:
         msg = response.choices[0].message
         messages.append(msg)
 
-        # 没有 tool call，结束
+        # No tool call, end
         if not msg.tool_calls:
             return
 
