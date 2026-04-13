@@ -96,12 +96,33 @@ Skills available:
 
 
 def safe_path(p: str) -> Path:
+    """Validate and sanitize a file path to prevent directory traversal attacks.
+
+    Args:
+        p: The path string to validate.
+
+    Returns:
+        A resolved Path object relative to WORKDIR.
+
+    Raises:
+        ValueError: If the path attempts to escape WORKDIR.
+    """
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError("Access denied")
     return path
 
 def run_bash(command: str) -> str:
+    """Execute a shell command safely without using shell=True.
+
+    Blocks dangerous patterns like pipes, redirections, and command chaining.
+
+    Args:
+        command: The shell command string to execute.
+
+    Returns:
+        Command output (stdout + stderr) or error message.
+    """
     # Block dangerous patterns more comprehensively
     dangerous_patterns = [';', '&&', '||', '|', '>', '<', '`', '$', 'sudo']
     for pattern in dangerous_patterns:
@@ -120,6 +141,15 @@ def run_bash(command: str) -> str:
             return f"Error: {e}"
 
 def run_read(path: str, limit: int = None) -> str:
+    """Read file contents with optional line limit.
+
+    Args:
+        path: Path to the file to read.
+        limit: Maximum number of lines to read (optional).
+
+    Returns:
+        File content as string, with truncation indicator if limited.
+    """
     try:
         text = safe_path(path).read_text()
         lines = text.splitlines()
@@ -130,6 +160,15 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
     
 def run_write(path: str, content: str) -> str:
+    """Write content to a file, creating parent directories if needed.
+
+    Args:
+        path: Path to write the file.
+        content: Content to write.
+
+    Returns:
+        Success message with byte count or error message.
+    """
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +178,16 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace old_text with new_text in a file (first occurrence only).
+
+    Args:
+        path: Path to the file to edit.
+        old_text: Text to search for.
+        new_text: Text to replace with.
+
+    Returns:
+        Success message or error message if old_text not found.
+    """
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -238,11 +287,26 @@ TOOL_HANDLERS = {
  
     
 def extract_text(message) -> str:
-    # OpenAI: message.content 
+    """Extract text content from an OpenAI message object.
+
+    Args:
+        message: An OpenAI message object with .content attribute.
+
+    Returns:
+        Stripped text content or empty string if none.
+    """
     return message.content.strip() if message.content else ""
 
 
 def agent_loop(messages: list) -> None:
+    """Main agent loop that handles tool calls from LLM responses.
+
+    Continuously calls the LLM, executes any requested tools,
+    and feeds results back until the LLM returns without tool calls.
+
+    Args:
+        messages: Conversation history list, modified in-place.
+    """
     while True:
         response = client.chat.completions.create(
             model=MODEL,
