@@ -124,21 +124,16 @@ def run_bash(command: str) -> str:
         Command output (stdout + stderr) or error message.
     """
     # Block dangerous patterns more comprehensively
-    dangerous_patterns = [';', '&&', '||', '|', '>', '<', '`', '$', 'sudo']
-    for pattern in dangerous_patterns:
-        if pattern in command:
-            raise ValueError(f"Dangerous character/pattern '{pattern}' detected in command")
-    if os.name != 'nt':  # Unix-like
-        # Safer: don't use shell=True for user input
-        try:
-            args = shlex.split(command)
-            r = subprocess.run(
-                args, shell=False, cwd=os.getcwd(),
-                capture_output=True, text=True, timeout=120
-            )
-            return (r.stdout + r.stderr).strip()[:50000] or "(no output)"
-        except Exception as e:
-            return f"Error: {e}"
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+    if any(d in command for d in dangerous):
+        return "Error: Dangerous command blocked"
+    try:
+        r = subprocess.run(command, shell=True, cwd=os.getcwd(),
+                           capture_output=True, text=True, timeout=120)
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int = None) -> str:
     """Read file contents with optional line limit.

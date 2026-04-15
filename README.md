@@ -38,5 +38,8 @@ s04
 s05 skill
 搞了半天就是按需把skill的内容提交上去，本质还是为了减少token的消耗。
 
+不过skill本身，定义了code review需要做些什么
+比如定义了checklist,需要的结果格式等。这些都是AI喜欢的语料，却是人类厌恶的。
+
 
 
