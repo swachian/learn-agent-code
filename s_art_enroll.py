@@ -87,7 +87,7 @@ def extract_names_from_image(image_path):
         img_b64 = base64.b64encode(f.read()).decode()
 
     prompt = """
-请识别图片中的表格，只返回第二列“姓名”的所有内容。
+请识别图片中的表格，只返回“姓名”的所有内容。
 要求：
 - 只输出姓名列表
 - 每行一个姓名
@@ -95,13 +95,22 @@ def extract_names_from_image(image_path):
 """
 
     resp = client.chat.completions.create(
-        model=MODEL,  
+        model=MODEL,
         messages=[
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-            ]}
-        ]
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_b64}"
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0  # ✅ 很关键，保证稳定输出
     )
 
     text = resp.choices[0].message.content
@@ -111,7 +120,7 @@ def extract_names_from_image(image_path):
         json.dump(names, f, ensure_ascii=False, indent=2)
     return names    
     
-    
+s = ['上外云间']   
 def run_agent():
     school_map = {
         "交附嘉定": (
@@ -130,6 +139,33 @@ def run_agent():
         ),
         "建平中学": (
             extract_names_from_image("image_jpzx.png")
+        ),
+        "大同中学": (
+            extract_names_from_image("image_dtzx.png")
+        ),
+        "向明中学": (
+            extract_names_from_image("image_xiangminzx.png")
+        ),
+        "市三女中": (
+            extract_names_from_image("image_ssnz.png")
+        ),
+        "市西中学": (
+            extract_names_from_image("image_sxzx.png")
+        ),
+        "上师大闵分": (
+            extract_names_from_image("image_ssdmf.jpg")
+        ),
+        "格致中学": (
+            extract_names_from_image("image_gzzx.png")
+        ),
+        "上师大附中": (
+            extract_names_from_image("image_shsffz.png")
+        ),
+        "复兴中学": (
+            extract_names_from_image("image_fdfx.png")
+        ),
+        "复附青浦": (
+            extract_names_from_image("image_ffqp.png")
         )
     }
 
