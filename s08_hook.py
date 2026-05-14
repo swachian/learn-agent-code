@@ -1,3 +1,22 @@
+# Harness: extensibility -- injecting behavior without touching the loop.
+"""
+s08_hook_system.py - Hook System
+Hooks are extension points around the main loop.
+They let readers add behavior without rewriting the loop itself.
+Teaching version:
+  - SessionStart
+  - PreToolUse
+  - PostToolUse
+Teaching exit-code contract:
+  - 0 -> continue
+  - 1 -> block
+  - 2 -> inject a message
+This is intentionally simpler than a production system. The goal here is to
+teach the extension pattern clearly before introducing event-specific edge
+cases.
+Key insight: "Extend the agent without touching the loop."
+"""
+
 import os
 import re
 import json
@@ -20,101 +39,130 @@ client = OpenAI(
 )
 
 WORKDIR = Path.cwd()
-MODEL = os.getenv("MODEL_ID", "moonshotai/kimi-k2.5")
+MODEL = os.getenv("MODEL_ID", "moonshotai/kimi-k2.6")
 
+
+HOOK_EVENTS = ("PreToolUse", "PostToolUse", "SessionStart")
+HOOK_TIMEOUT = 30  # seconds
+# Real CC timeouts:
+#   TOOL_HOOK_EXECUTION_TIMEOUT_MS = 600000 (10 minutes for tool hooks)
+#   SESSION_END_HOOK_TIMEOUT_MS = 1500 (1.5 seconds for SessionEnd hooks)
+
+TRUST_MARKER = WORKDIR / ".claude" / ".claude_trusted"
+
+class HookManager:
+    """
+    Load and execute hooks from .hooks.json configuration.
+    The hook manager does three simple jobs:
+    - load hook definitions
+    - run matching commands for an event
+    - aggregate block / message results for the caller
+    """
+    def __init__(self, config_path: Path = None, sdk_mode: bool = False):
+        self.hooks = {"PreToolUse": [], "PostToolUse": [], "SessionStart": []}
+        self._sdk_mode = sdk_mode
+        config_path = config_path or (WORKDIR / ".hooks.json")
+        if config_path.exists():
+            try:
+                config = json.loads(config_path.read_text())
+                for event in HOOK_EVENTS:
+                    self.hooks[event] = config.get("hooks", {}).get(event, [])
+                print(f"[Hooks loaded from {config_path}]")
+            except Exception as e:
+                print(f"[Hook config error: {e}]")
+    def _check_workspace_trust(self) -> bool:
+        """
+        Check whether the current workspace is trusted.
+        The teaching version uses a simple trust marker file.
+        In SDK mode, trust is treated as implicit.
+        """
+        if self._sdk_mode:
+            return True
+        return TRUST_MARKER.exists()
+    def run_hooks(self, event: str, context: dict = None) -> dict:
+        """
+        Execute all hooks for an event.
+        Returns: {"blocked": bool, "messages": list[str]}
+          - blocked: True if any hook returned exit code 1
+          - messages: stderr content from exit-code-2 hooks (to inject)
+        """
+        result = {"blocked": False, "messages": []}
+        # Trust gate: refuse to run hooks in untrusted workspaces
+        if not self._check_workspace_trust():
+            return result
+        hooks = self.hooks.get(event, [])
+        for hook_def in hooks:
+            # Check matcher (tool name filter for PreToolUse/PostToolUse)
+            matcher = hook_def.get("matcher")
+            if matcher and context:
+                tool_name = context.get("tool_name", "")
+                if matcher != "*" and matcher != tool_name:
+                    continue
+            command = hook_def.get("command", "")
+            if not command:
+                continue
+            # Build environment with hook context
+            env = dict(os.environ)
+            if context:
+                env["HOOK_EVENT"] = event
+                env["HOOK_TOOL_NAME"] = context.get("tool_name", "")
+                env["HOOK_TOOL_INPUT"] = json.dumps(
+                    context.get("tool_input", {}), ensure_ascii=False)[:10000]
+                if "tool_output" in context:
+                    env["HOOK_TOOL_OUTPUT"] = str(
+                        context["tool_output"])[:10000]
+            try:
+                r = subprocess.run(
+                    command, shell=True, cwd=WORKDIR, env=env,
+                    capture_output=True, text=True, timeout=HOOK_TIMEOUT,
+                )
+                if r.returncode == 0:
+                    # Continue silently
+                    if r.stdout.strip():
+                        print(f"  [hook:{event}] {r.stdout.strip()[:100]}")
+                    # Optional structured stdout: small extension point that
+                    # keeps the teaching contract simple.
+                    try:
+                        hook_output = json.loads(r.stdout)
+                        if "updatedInput" in hook_output and context:
+                            context["tool_input"] = hook_output["updatedInput"]
+                        if "additionalContext" in hook_output:
+                            result["messages"].append(
+                                hook_output["additionalContext"])
+                        if "permissionDecision" in hook_output:
+                            result["permission_override"] = (
+                                hook_output["permissionDecision"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # stdout was not JSON -- normal for simple hooks
+                elif r.returncode == 1:
+                    # Block execution
+                    result["blocked"] = True
+                    reason = r.stderr.strip() or "Blocked by hook"
+                    result["block_reason"] = reason
+                    print(f"  [hook:{event}] BLOCKED: {reason[:200]}")
+                elif r.returncode == 2:
+                    # Inject message
+                    msg = r.stderr.strip()
+                    if msg:
+                        result["messages"].append(msg)
+                        print(f"  [hook:{event}] INJECT: {msg[:200]}")
+                else:
+                    # Block execution
+                    result["blocked"] = True
+                    reason = r.stderr.strip() or "Blocked by hook"
+                    result["block_reason"] = reason
+                    print(f"  [hook:{event}] BLOCKED: {reason[:200]}")
+            except subprocess.TimeoutExpired:
+                print(f"  [hook:{event}] Timeout ({HOOK_TIMEOUT}s)")
+            except Exception as e:
+                print(f"  [hook:{event}] Error: {e}")
+        return result
 
 
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
-THRESHOLD = 2000
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-KEEP_RECENT = 3
-PRESERVE_RESULT_TOOLS = {"read_file"}
 
-
-def estimate_tokens(messages: list) -> int:
-    """Rough token count: ~4 chars per token."""
-    return len(str(messages)) // 4
-
-
-# -- Layer 1: micro_compact - replace old tool results with placeholders --
-def micro_compact(messages: list) -> list:
-    # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
-    tool_results = []
-    for msg_idx, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for part_idx, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((msg_idx, part_idx, part))
-    if len(tool_results) <= KEEP_RECENT:
-        return messages
-    # Find tool_name for each result by matching tool_use_id in prior assistant messages
-    tool_name_map = {}
-    for msg in messages:
-        if msg["role"] == "assistant":
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if hasattr(block, "type") and block.type == "tool_use":
-                        tool_name_map[block.id] = block.name
-    # Clear old results (keep last KEEP_RECENT). Preserve read_file outputs because
-    # they are reference material; compacting them forces the agent to re-read files.
-    to_clear = tool_results[:-KEEP_RECENT]
-    for _, _, result in to_clear:
-        if not isinstance(result.get("content"), str) or len(result["content"]) <= 100:
-            continue
-        tool_id = result.get("tool_use_id", "")
-        tool_name = tool_name_map.get(tool_id, "unknown")
-        if tool_name in PRESERVE_RESULT_TOOLS:
-            continue
-        result["content"] = f"[Previous: used {tool_name}]"
-    return messages
- 
-# -- Layer 2: auto_compact - save transcript, summarize, replace messages --
-def auto_compact(messages: list) -> list:
-    # Save full transcript to disk
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    print(f"[transcript saved: {transcript_path}]")
-    # Ask LLM to summarize
-    conversation_text = json.dumps(messages, default=str)[-80000:]
-    # response = client.messages.create(
-    #     model=MODEL,
-    #     messages=[{"role": "user", "content":
-    #         "Summarize this conversation for continuity. Include: "
-    #         "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-    #         "Be concise but preserve critical details.\n\n" + conversation_text}],
-    #     max_tokens=2000,
-    # )
-    # summary = next((block.text for block in response.content if hasattr(block, "text")), "")
-    
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Summarize this conversation...\n\n"
-                    + conversation_text
-                )
-            }
-        ],
-        max_tokens=8000,
-    )
-
-    summary = response.choices[0].message.content
-    
-    if not summary:
-        summary = "No summary generated."
-    # Replace all messages with compressed summary
-    return [
-        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
-    ]
-    
     
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
@@ -174,7 +222,6 @@ TOOL_HANDLERS = {
         kw["old_text"],
         kw["new_text"]
     ),
-    "compact":    lambda **kw: "Manual compression requested.",
 }
 
 TOOLS = [
@@ -260,23 +307,6 @@ TOOLS = [
                 ]
             }
         }
-    },
-
-    {
-        "type": "function",
-        "function": {
-            "name": "compact",
-            "description": "Trigger manual conversation compression.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "focus": {
-                        "type": "string",
-                        "description": "What to preserve in the summary"
-                    }
-                }
-            }
-        }
     }
 ]
 
@@ -286,7 +316,7 @@ TOOLS = [
 # Agent loop
 # ---------------------------------------------------
 
-def agent_loop(messages: list):
+def agent_loop(messages: list, hooks: HookManager):
 
     turn = 0
 
@@ -308,41 +338,6 @@ def agent_loop(messages: list):
                 len(messages)
             )
 
-            # ----------------------------------------
-            # Layer 1: micro compact
-            # ----------------------------------------
-
-            with tracer.start_as_current_span(
-                "micro_compact"
-            ):
-
-                micro_compact(messages)
-
-            # ----------------------------------------
-            # Layer 2: auto compact
-            # ----------------------------------------
-
-            estimated_tokens = estimate_tokens(messages)
-
-            agent_span.set_attribute(
-                "agent.estimated_tokens",
-                estimated_tokens
-            )
-
-            if estimated_tokens > THRESHOLD:
-
-                with tracer.start_as_current_span(
-                    "auto_compact"
-                ):
-
-                    print("[auto_compact triggered]")
-
-                    messages[:] = auto_compact(messages)
-
-            # ----------------------------------------
-            # LLM call
-            # ----------------------------------------
-
             with tracer.start_as_current_span(
                 "llm_call"
             ) as llm_span:
@@ -363,12 +358,6 @@ def agent_loop(messages: list):
                     "llm.prompt_preview",
                     preview
                 )
-
-                llm_span.set_attribute(
-                    "llm.estimated_tokens",
-                    estimate_tokens(messages)
-                )
-
                 response = client.chat.completions.create(
                     model=MODEL,
 
@@ -438,6 +427,8 @@ def agent_loop(messages: list):
             # Execute tools
             # ----------------------------------------
 
+            tool_results = []
+            
             for tool_call in tool_calls:
 
                 tool_name = tool_call.function.name
@@ -451,7 +442,24 @@ def agent_loop(messages: list):
                 args = json.loads(
                     tool_call.function.arguments
                 )
+                ctx = {"tool_name": tool_name, "tool_input": args}
 
+                pre = hooks.run_hooks("PreToolUse", ctx)
+                
+                for m in pre.get("messages", []):
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": f"[Hook]: {m}",
+                    })
+                    
+                if pre.get("blocked"):
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": f"Blocked: {pre.get('block_reason')}",
+                    })
+                    return
                 with tracer.start_as_current_span(
                     f"tool:{tool_name}"
                 ) as tool_span:
@@ -473,6 +481,12 @@ def agent_loop(messages: list):
                             manual_compact = True
 
                             output = "Compressing..."
+                            
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": str(output),
+                            })
 
                         else:
 
@@ -506,64 +520,47 @@ def agent_loop(messages: list):
                         "tool.output_length",
                         len(str(output))
                     )
+                    ctx["tool_output"] = output
+                    post = hooks.run_hooks("PostToolUse", ctx)
+                    
+                    for m in post.get("messages", []):
+                        output += f"\n[Hook]: {m}"
+
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": str(output),
+                    })
+                    messages.extend(tool_results)
+
 
                 print(f"> {tool_name}:")
                 print(str(output)[:200])
 
-                # Append tool result
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": str(output),
-                })
                 
-                if len(messages) == 13:
-                    manual_compact = True
 
-            # ----------------------------------------
-            # Layer 3: manual compact
-            # ----------------------------------------
 
-            if manual_compact:
 
-                with tracer.start_as_current_span(
-                    "manual_compact"
-                ):
-
-                    print("[manual compact]")
-
-                    messages[:] = auto_compact(messages)
-                    
-                    print(messages)
-
-                return
 
 
 if __name__ == "__main__":
+    hooks = HookManager()
+    # Fire SessionStart hooks
+    hooks.run_hooks("SessionStart", {"tool_name": "", "tool_input": {}})
     history = []
-
     while True:
         try:
-            query = input("\033[36ms06 >> \033[0m")
+            query = input("\033[36ms08 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-
         if query.strip().lower() in ("q", "exit", ""):
             break
-
         history.append({"role": "user", "content": query})
-
-        agent_loop(history)
-
-        response_content = history[-1].get("content")
-
-        if isinstance(response_content, str):
-            print(response_content)
-
+        agent_loop(history, hooks)
+        response_content = history[-1]["content"]
+        if isinstance(response_content, list):
+            for block in response_content:
+                if hasattr(block, "text"):
+                    print(block.text)
         print()
         
-    """
-    1. Read every Python file in the ./ directory one by one
-    2. Keep reading files until compression triggers automatically
-    Read every Python file in the ./ directory one by one, and tell me a story  about them one by one.
-    """

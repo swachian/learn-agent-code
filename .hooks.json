@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "bash", "command": "echo 'Checking bash command...'"},
+      {"matcher": "write_file", "command": "/path/to/lint-check.sh"}
+    ],
+    "PostToolUse": [
+      {"command": "echo 'Tool finished'"}
+    ],
+    "SessionStart": [
+      {"command": "echo \"Session started at $(date)\""}
+    ]
+  }
+}

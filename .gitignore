@@ -13,3 +13,7 @@ secret
 2024年资格_关联2026年优秀名单.xlsx
 output.xlsx
 
+.transcripts/**
+otel_trace.jsonl
+.claude
+111.txt
