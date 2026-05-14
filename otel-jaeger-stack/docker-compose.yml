@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      - "14250:14250"
+   
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector.yml"]
+    volumes:
+      - ./collector/otel-collector.yml:/etc/otel-collector.yml
+    ports:
+      - "4317:4317"   # OTLP gRPC (from SDK)
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # internal metrics
+
+    depends_on:
+      - jaeger
