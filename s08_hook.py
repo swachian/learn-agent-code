@@ -394,6 +394,8 @@ def agent_loop(messages: list, hooks: HookManager):
                         response.usage.total_tokens
                     )
 
+                    llm_span.set_attribute("response", str(response.choices[0].message)[0:1000])
+                    
             assistant_message = response.choices[0].message
 
             # ----------------------------------------
@@ -419,6 +421,7 @@ def agent_loop(messages: list, hooks: HookManager):
                     True
                 )
 
+                print(assistant_message.content)
                 return
 
             manual_compact = False
