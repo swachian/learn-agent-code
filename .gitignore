@@ -17,3 +17,9 @@ output.xlsx
 otel_trace.jsonl
 .claude
 111.txt
+otel_trace513.jsonl
+sample.py
+.memory
+.data
+.agent_history
+output/**

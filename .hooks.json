@@ -1,8 +1,7 @@
 {
   "hooks": {
     "PreToolUse": [
-      {"matcher": "bash", "command": "echo 'Checking bash command...'"},
-      {"matcher": "write_file", "command": "/path/to/lint-check.sh"}
+      {"matcher": "bash", "command": "echo 'Checking bash command...'"}
     ],
     "PostToolUse": [
       {"command": "echo 'Tool finished'"}

@@ -49,8 +49,12 @@ s08 是讲的通过hooks来装配agents的功能，这个比较好，甚至可�
 在这组间隙，加了一下otel到jaeger和grafana的集成。感叹一下，现在观察工具真是贴心。
 引入jaeger的替手grafana/tempo
  
- 
+s09
 
+User和feedback有什么区别？ // LLM不太分得出来
+mem里面的content和description区别是什么？
+都上传上去吗,欠缺search memory
+ 
 
 
 
