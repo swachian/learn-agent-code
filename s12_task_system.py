@@ -1,18 +1,34 @@
 # Harness: extensibility -- injecting behavior without touching the loop.
 """
-LLM call
-  |
-  +-- stop_reason == "max_tokens"
-  |      -> append continuation reminder
-  |      -> retry
-  |
-  +-- prompt too long
-  |      -> compact context
-  |      -> retry
-  |
-  +-- timeout / rate limit / connection error
-         -> back off
-         -> retry
+s12_task_system.py - Tasks
+Tasks persist as JSON files in .tasks/ so they survive context compression.
+Each task carries a small dependency graph:
+- blockedBy: what must finish first
+- blocks: what this task unlocks later
+    .tasks/
+      task_1.json  {"id":1, "subject":"...", "status":"completed", ...}
+      task_2.json  {"id":2, "blockedBy":[1], "status":"pending", ...}
+      task_3.json  {"id":3, "blockedBy":[2], "blocks":[], ...}
+    Dependency resolution:
+    +----------+     +----------+     +----------+
+    | task 1   | --> | task 2   | --> | task 3   |
+    | complete |     | blocked  |     | blocked  |
+    +----------+     +----------+     +----------+
+         |                ^
+         +--- completing task 1 removes it from task 2's blockedBy
+Key idea: task state survives compression because it lives on disk, not only
+inside the conversation.
+These are durable work-graph tasks, not transient runtime execution slots.
+Read this file in this order:
+1. TaskManager: what a TaskRecord looks like on disk.
+2. TOOL_HANDLERS / TOOLS: how task operations enter the same loop as normal tools.
+3. agent_loop: how persistent work state is exposed back to the model.
+Most common confusion:
+- a task record is a durable work item
+- it is not a thread, background slot, or worker process
+Teaching boundary:
+this chapter teaches the durable work graph first.
+Runtime execution slots and schedulers arrive later.
 """
 
 import os
@@ -57,73 +73,87 @@ HOOK_TIMEOUT = 30  # seconds
 #   SESSION_END_HOOK_TIMEOUT_MS = 1500 (1.5 seconds for SessionEnd hooks)
 
 TRUST_MARKER = WORKDIR / ".claude" / ".claude_trusted"
+TASKS_DIR = WORKDIR / ".tasks"
 
-# Recovery constants
-MAX_RECOVERY_ATTEMPTS = 15
-BACKOFF_BASE_DELAY = 1.0  # seconds
-BACKOFF_MAX_DELAY = 30.0  # seconds
-TOKEN_THRESHOLD = 50000   # chars / 4 ~ tokens for compact trigger
-CONTINUATION_MESSAGE = (
-    "Output limit hit. Continue directly from where you stopped -- "
-    "no recap, no repetition. Pick up mid-sentence if needed."
-)
-def estimate_tokens(messages: list) -> int:
-    """Rough token estimate: ~4 chars per token."""
-    return len(json.dumps(messages, default=str)) // 4
+# -- TaskManager: CRUD for a persistent task graph --
+class TaskManager:
+    """Persistent TaskRecord store.
+    Think "work graph on disk", not "currently running worker".
+    """
+    def __init__(self, tasks_dir: Path):
+        self.dir = tasks_dir
+        self.dir.mkdir(exist_ok=True)
+        self._next_id = self._max_id() + 1
+    def _max_id(self) -> int:
+        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
+        return max(ids) if ids else 0
+    def _load(self, task_id: int) -> dict:
+        path = self.dir / f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        return json.loads(path.read_text())
+    def _save(self, task: dict):
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2))
+    def create(self, subject: str, description: str = "") -> str:
+        task = {
+            "id": self._next_id, "subject": subject, "description": description,
+            "status": "pending", "blockedBy": [], "blocks": [], "owner": "",
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2)
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._load(task_id), indent=2)
+    def update(self, task_id: int, status: str = None, owner: str = None,
+               add_blocked_by: list = None, add_blocks: list = None) -> str:
+        task = self._load(task_id)
+        if owner is not None:
+            task["owner"] = owner
+        if status:
+            if status not in ("pending", "in_progress", "completed", "deleted"):
+                raise ValueError(f"Invalid status: {status}")
+            task["status"] = status
+            # When a task is completed, remove it from all other tasks' blockedBy
+            if status == "completed":
+                self._clear_dependency(task_id)
+        if add_blocked_by:
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        if add_blocks:
+            task["blocks"] = list(set(task["blocks"] + add_blocks))
+            # Bidirectional: also update the blocked tasks' blockedBy lists
+            for blocked_id in add_blocks:
+                try:
+                    blocked = self._load(blocked_id)
+                    if task_id not in blocked["blockedBy"]:
+                        blocked["blockedBy"].append(task_id)
+                        self._save(blocked)
+                except ValueError:
+                    pass
+        self._save(task)
+        return json.dumps(task, indent=2)
+    def _clear_dependency(self, completed_id: int):
+        """Remove completed_id from all other tasks' blockedBy lists."""
+        for f in self.dir.glob("task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task.get("blockedBy", []):
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
+    def list_all(self) -> str:
+        tasks = []
+        for f in sorted(self.dir.glob("task_*.json")):
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return "No tasks."
+        lines = []
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]", "deleted": "[-]"}.get(t["status"], "[?]")
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            owner = f" owner={t['owner']}" if t.get("owner") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{owner}{blocked}")
+        return "\n".join(lines)
 
-def auto_compact(messages: list) -> list:
-    # Save full transcript to disk
 
-    # Ask LLM to summarize
-    conversation_text = json.dumps(messages, default=str)[-80000:]
-    # response = client.messages.create(
-    #     model=MODEL,
-    #     messages=[{"role": "user", "content":
-    #         "Summarize this conversation for continuity. Include: "
-    #         "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-    #         "Be concise but preserve critical details.\n\n" + conversation_text}],
-    #     max_tokens=2000,
-    # )
-    # summary = next((block.text for block in response.content if hasattr(block, "text")), "")
-    
-    try: 
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Summarize this conversation for continuity. Include:\n"
-                        "1) Task overview and success criteria\n"
-                        "2) Current state: completed work, files touched\n"
-                        "3) Key decisions and failed approaches\n"
-                        "4) Remaining next steps\n"
-                        "Be concise but preserve critical details.\n\n"
-                        + conversation_text
-                    )
-                }
-            ],
-            max_tokens=8000,
-        )
-
-        summary = response.choices[0].message.content
-    except Exception as e:
-        summary = f"(compact failed: {e}). Previous context lost."
-        
-    continuation = (
-        "This session continues from a previous conversation that was compacted. "
-        f"Summary of prior context:\n\n{summary}\n\n"
-        "Continue from where we left off without re-asking the user."
-    )
-    return [{"role": "user", "content": continuation}]
-
-import random
-
-def backoff_delay(attempt: int) -> float:
-    """Exponential backoff with jitter: base * 2^attempt + random(0, 1)."""
-    delay = min(BACKOFF_BASE_DELAY * (2 ** attempt), BACKOFF_MAX_DELAY)
-    jitter = random.uniform(0, 1)
-    return delay + jitter
 
 class MemoryManager:
     """
@@ -369,6 +399,8 @@ When NOT to save:
 - Secrets or credentials (API keys, passwords)
 """
 
+TASKS = TaskManager(TASKS_DIR)
+
 def normalize_tool(tool):
     if "function" in tool:
         fn = tool["function"]
@@ -608,6 +640,22 @@ TOOL_HANDLERS = {
         kw["mem_type"],
         kw["content"]
     ),
+    "task_create": lambda **kw: TASKS.create(
+        kw["subject"],
+        kw.get("description", "")
+    ),
+
+    "task_update": lambda **kw: TASKS.update(
+        kw["task_id"],
+        kw.get("status"),
+        kw.get("owner"),
+        kw.get("addBlockedBy"),
+        kw.get("addBlocks")
+    ),
+
+    "task_list": lambda **kw: TASKS.list_all(),
+
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
 }
 
 TOOLS = [
@@ -727,7 +775,65 @@ TOOLS = [
     }
  },
    
-  
+{
+        "type": "function",
+        "function": {
+            "name": "task_create",
+            "description": "Create a new task with subject and optional description.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["subject"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_update",
+            "description": "Update a task's status, owner, or dependency relations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "owner": {"type": "string"},
+                    "addBlockedBy": {"type": "string"},
+                    "addBlocks": {"type": "string"}
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": "List all tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_get",
+            "description": "Get a task by task_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"}
+                },
+                "required": ["task_id"]
+            }
+        }
+    },  
 ]
 
 # Global prompt builder
@@ -741,186 +847,228 @@ TOOLS_SAFE = json.loads(json.dumps(TOOLS))
 def agent_loop(messages: list, hooks: HookManager):
 
     turn = 0
-    max_output_recovery_count = 0
 
     while True:
+
         turn += 1
 
-        with tracer.start_as_current_span(f"agent_turn_{turn}") as agent_span:
+        with tracer.start_as_current_span(
+            f"agent_turn_{turn}"
+        ) as agent_span:
 
-            agent_span.set_attribute("agent.turn", turn)
-            agent_span.set_attribute("agent.message_count", len(messages))
+            agent_span.set_attribute(
+                "agent.turn",
+                turn
+            )
 
-            # -------------------------------------------------
-            # PRE-CALL: token compaction guard (PROACTIVE)
-            # -------------------------------------------------
-            if estimate_tokens(messages) > TOKEN_THRESHOLD:
-                agent_span.add_event("auto_compact_triggered")
-                messages[:] = auto_compact(messages)
+            agent_span.set_attribute(
+                "agent.message_count",
+                len(messages)
+            )
 
-            # -------------------------------------------------
-            # API CALL (with retry + prompt-too-long recovery)
-            # -------------------------------------------------
-            response = None
+            with tracer.start_as_current_span(
+                "llm_call"
+            ) as llm_span:
 
-            for attempt in range(MAX_RECOVERY_ATTEMPTS + 1):
+                llm_span.set_attribute(
+                    "llm.model",
+                    MODEL
+                )
 
-                try:
-                    with tracer.start_as_current_span("llm_call") as llm_span:
+                llm_span.set_attribute(
+                    "llm.message_count",
+                    len(messages)
+                )
+                
+                preview = str(messages[-3:])[:1000]
 
-                        system = prompt_builder.build()
+                llm_span.set_attribute(
+                    "llm.prompt_preview",
+                    preview
+                )
+                system = prompt_builder.build()
+                llm_span.set_attribute("llm.system_prompt", system)
+                response = client.chat.completions.create(
+                    model=MODEL,
 
-                        llm_span.set_attribute("llm.model", MODEL)
-                        llm_span.set_attribute("llm.message_count", len(messages))
-                        llm_span.set_attribute("llm.system_prompt", system)
-
-                        agent_span.add_event("start query")
-                        llm_span.add_event("start query 2")
-                        
-                        response = client.chat.completions.create(
-                            model=MODEL,
-                            messages=[{"role": "system", "content": system}, *messages],
-                            tools=TOOLS_SAFE,
-                            tool_choice="auto",
-                            max_tokens=2000,
-                        )
-
-                        break  # success
-
-                except Exception as e:
-
-                    err = str(e).lower()
-
-                    # -----------------------------
-                    # prompt too long recovery
-                    # -----------------------------
-                    if "overlong" in err or "prompt" in err:
-                        agent_span.add_event("prompt_too_long_recovery")
-
-                        messages[:] = auto_compact(messages)
-                        continue
-
-                    # -----------------------------
-                    # network retry backoff
-                    # -----------------------------
-                    if attempt < MAX_RECOVERY_ATTEMPTS:
-                        delay = backoff_delay(attempt)
-
-                        agent_span.add_event(
-                            "retry",
-                            {"attempt": attempt, "delay": delay}
-                        )
-
-                        time.sleep(delay)
-                        continue
-
-                    raise
-
-            if response is None:
-                return
-
-            assistant_message = response.choices[0].message
-            
-            print(response.choices[0].finish_reason)
-             
-            if response.choices[0].finish_reason == "length":
-                max_output_recovery_count += 1
-
-                if max_output_recovery_count <= MAX_RECOVERY_ATTEMPTS:
-
-                    agent_span.add_event("max_tokens_recovery")
-
-                    messages.append({
-                        "role": "assistant",
-                        "content": assistant_message.content or "",
-                        "tool_calls": assistant_message.tool_calls,
-                    })
-                    messages.append({
-                        "role": "user",
-                        "content": CONTINUATION_MESSAGE
-                    })
-                    agent_span.add_event(
-                        "max_tokens_recovery",
+                    messages=[
                         {
-                            "last_messages": "\n\n".join(
-                                f"{m.get('role')}: {str(m.get('content'))[:300]}"
-                                for m in messages[-3:]
-                            )[:5000]
-                        }
+                            "role": "system",
+                            "content": system,
+                        },
+                        *messages
+                    ],
+
+                    tools=TOOLS_SAFE,
+
+                    tool_choice="auto",
+
+                    max_tokens=8000,
+                )
+
+                # Token usage
+                if response.usage:
+
+                    llm_span.set_attribute(
+                        "llm.prompt_tokens",
+                        response.usage.prompt_tokens
                     )
 
-                    continue
+                    llm_span.set_attribute(
+                        "llm.completion_tokens",
+                        response.usage.completion_tokens
+                    )
 
-                else:
-                    agent_span.add_event("max_tokens_exhausted")
-                    return
+                    llm_span.set_attribute(
+                        "llm.total_tokens",
+                        response.usage.total_tokens
+                    )
 
-            # -------------------------------------------------
-            # STORE ASSISTANT MESSAGE
-            # -------------------------------------------------
+                    llm_span.set_attribute("response", str(response.choices[0].message)[0:1000])
+                    
+            assistant_message = response.choices[0].message
+
+            # ----------------------------------------
+            # Append assistant message
+            # ----------------------------------------
+
             messages.append({
                 "role": "assistant",
                 "content": assistant_message.content or "",
                 "tool_calls": assistant_message.tool_calls,
             })
 
-            # -------------------------------------------------
-            # STOP CONDITION (NO TOOL)
-            # -------------------------------------------------
-            if not assistant_message.tool_calls:
+            tool_calls = assistant_message.tool_calls
 
-                agent_span.set_attribute("agent.finished", True)
+            # ----------------------------------------
+            # Final response
+            # ----------------------------------------
+
+            if not tool_calls:
+
+                agent_span.set_attribute(
+                    "agent.finished",
+                    True
+                )
+
                 print(assistant_message.content)
                 return
 
-            # =================================================
-            # TOOL EXECUTION PHASE (your original logic)
-            # =================================================
-            tool_results = []
+            manual_compact = False
 
-            for tool_call in assistant_message.tool_calls:
+            # ----------------------------------------
+            # Execute tools
+            # ----------------------------------------
+
+            tool_results = []
+            
+            for tool_call in tool_calls:
 
                 tool_name = tool_call.function.name
-                args = json5.loads(tool_call.function.arguments)
+                agent_span.add_event(
+                    "tool_selected",
+                    {
+                        "tool.name": tool_name,
+                    }
+                )
 
-                agent_span.add_event("tool_selected", {
-                    "tool.name": tool_name
-                })
-
+                args = json5.loads(
+                    tool_call.function.arguments
+                )
                 ctx = {"tool_name": tool_name, "tool_input": args}
 
                 pre = hooks.run_hooks("PreToolUse", ctx)
-
+                
+                for m in pre.get("messages", []):
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": f"[Hook]: {m}",
+                    })
+                    
                 if pre.get("blocked"):
                     tool_results.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": f"Blocked: {pre.get('block_reason')}",
                     })
-                    continue
+                    return
+                with tracer.start_as_current_span(
+                    f"tool:{tool_name}"
+                ) as tool_span:
 
-                try:
-                    handler = TOOL_HANDLERS.get(tool_name)
-                    output = handler(**args) if handler else f"Unknown tool: {tool_name}"
+                    tool_span.set_attribute(
+                        "tool.name",
+                        tool_name
+                    )
 
-                except Exception as e:
-                    output = f"Error: {e}"
+                    tool_span.set_attribute(
+                        "tool.args_preview",
+                        str(args)[:300]
+                    )
 
-                ctx["tool_output"] = output
-                post = hooks.run_hooks("PostToolUse", ctx)
+                    try:
 
-                for m in post.get("messages", []):
-                    output += f"\n[Hook]: {m}"
+                        if tool_name == "compact":
 
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": str(output),
-                })
+                            manual_compact = True
 
-                print(f"> {tool_name}: {str(output)[:200]}")
+                            output = "Compressing..."
+                            
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": str(output),
+                            })
 
-            messages.extend(tool_results)
+                        else:
+
+                            handler = TOOL_HANDLERS.get(
+                                tool_name
+                            )
+
+                            output = (
+                                handler(**args)
+                                if handler
+                                else f"Unknown tool: {tool_name}"
+                            )
+
+                        tool_span.set_attribute(
+                            "tool.success",
+                            True
+                        )
+
+                    except Exception as e:
+
+                        output = f"Error: {e}"
+
+                        tool_span.record_exception(e)
+
+                        tool_span.set_attribute(
+                            "tool.success",
+                            False
+                        )
+
+                    tool_span.set_attribute(
+                        "tool.output_length",
+                        len(str(output))
+                    )
+                    ctx["tool_output"] = output
+                    post = hooks.run_hooks("PostToolUse", ctx)
+                    
+                    for m in post.get("messages", []):
+                        output += f"\n[Hook]: {m}"
+
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": str(output),
+                    })
+                    messages.extend(tool_results)
+
+
+                print(f"> {tool_name}:")
+                print(str(output)[:200])
 
                 
 
@@ -950,7 +1098,7 @@ if __name__ == "__main__":
     )
     while True:
         try:
-            query = session.prompt("s11 >> ")
+            query = session.prompt("s12 >> ")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
