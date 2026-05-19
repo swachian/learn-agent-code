@@ -58,6 +58,73 @@ HOOK_TIMEOUT = 30  # seconds
 
 TRUST_MARKER = WORKDIR / ".claude" / ".claude_trusted"
 
+# Recovery constants
+MAX_RECOVERY_ATTEMPTS = 15
+BACKOFF_BASE_DELAY = 1.0  # seconds
+BACKOFF_MAX_DELAY = 30.0  # seconds
+TOKEN_THRESHOLD = 50000   # chars / 4 ~ tokens for compact trigger
+CONTINUATION_MESSAGE = (
+    "Output limit hit. Continue directly from where you stopped -- "
+    "no recap, no repetition. Pick up mid-sentence if needed."
+)
+def estimate_tokens(messages: list) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    return len(json.dumps(messages, default=str)) // 4
+
+def auto_compact(messages: list) -> list:
+    # Save full transcript to disk
+
+    # Ask LLM to summarize
+    conversation_text = json.dumps(messages, default=str)[-80000:]
+    # response = client.messages.create(
+    #     model=MODEL,
+    #     messages=[{"role": "user", "content":
+    #         "Summarize this conversation for continuity. Include: "
+    #         "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+    #         "Be concise but preserve critical details.\n\n" + conversation_text}],
+    #     max_tokens=2000,
+    # )
+    # summary = next((block.text for block in response.content if hasattr(block, "text")), "")
+    
+    try: 
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize this conversation for continuity. Include:\n"
+                        "1) Task overview and success criteria\n"
+                        "2) Current state: completed work, files touched\n"
+                        "3) Key decisions and failed approaches\n"
+                        "4) Remaining next steps\n"
+                        "Be concise but preserve critical details.\n\n"
+                        + conversation_text
+                    )
+                }
+            ],
+            max_tokens=8000,
+        )
+
+        summary = response.choices[0].message.content
+    except Exception as e:
+        summary = f"(compact failed: {e}). Previous context lost."
+        
+    continuation = (
+        "This session continues from a previous conversation that was compacted. "
+        f"Summary of prior context:\n\n{summary}\n\n"
+        "Continue from where we left off without re-asking the user."
+    )
+    return [{"role": "user", "content": continuation}]
+
+import random
+
+def backoff_delay(attempt: int) -> float:
+    """Exponential backoff with jitter: base * 2^attempt + random(0, 1)."""
+    delay = min(BACKOFF_BASE_DELAY * (2 ** attempt), BACKOFF_MAX_DELAY)
+    jitter = random.uniform(0, 1)
+    return delay + jitter
+
 class MemoryManager:
     """
     Load, build, and save persistent memories across sessions.
@@ -674,228 +741,178 @@ TOOLS_SAFE = json.loads(json.dumps(TOOLS))
 def agent_loop(messages: list, hooks: HookManager):
 
     turn = 0
+    max_output_recovery_count = 0
 
     while True:
-
         turn += 1
 
-        with tracer.start_as_current_span(
-            f"agent_turn_{turn}"
-        ) as agent_span:
+        with tracer.start_as_current_span(f"agent_turn_{turn}") as agent_span:
 
-            agent_span.set_attribute(
-                "agent.turn",
-                turn
-            )
+            agent_span.set_attribute("agent.turn", turn)
+            agent_span.set_attribute("agent.message_count", len(messages))
 
-            agent_span.set_attribute(
-                "agent.message_count",
-                len(messages)
-            )
+            # -------------------------------------------------
+            # PRE-CALL: token compaction guard (PROACTIVE)
+            # -------------------------------------------------
+            if estimate_tokens(messages) > TOKEN_THRESHOLD:
+                agent_span.add_event("auto_compact_triggered")
+                messages[:] = auto_compact(messages)
 
-            with tracer.start_as_current_span(
-                "llm_call"
-            ) as llm_span:
+            # -------------------------------------------------
+            # API CALL (with retry + prompt-too-long recovery)
+            # -------------------------------------------------
+            response = None
 
-                llm_span.set_attribute(
-                    "llm.model",
-                    MODEL
-                )
+            for attempt in range(MAX_RECOVERY_ATTEMPTS + 1):
 
-                llm_span.set_attribute(
-                    "llm.message_count",
-                    len(messages)
-                )
-                
-                preview = str(messages[-3:])[:1000]
+                try:
+                    with tracer.start_as_current_span("llm_call") as llm_span:
 
-                llm_span.set_attribute(
-                    "llm.prompt_preview",
-                    preview
-                )
-                system = prompt_builder.build()
-                llm_span.set_attribute("llm.system_prompt", system)
-                response = client.chat.completions.create(
-                    model=MODEL,
+                        system = prompt_builder.build()
 
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": system,
-                        },
-                        *messages
-                    ],
+                        llm_span.set_attribute("llm.model", MODEL)
+                        llm_span.set_attribute("llm.message_count", len(messages))
+                        llm_span.set_attribute("llm.system_prompt", system)
 
-                    tools=TOOLS_SAFE,
+                        agent_span.add_event("start query")
+                        llm_span.add_event("start query 2")
+                        
+                        response = client.chat.completions.create(
+                            model=MODEL,
+                            messages=[{"role": "system", "content": system}, *messages],
+                            tools=TOOLS_SAFE,
+                            tool_choice="auto",
+                            max_tokens=2000,
+                        )
 
-                    tool_choice="auto",
+                        break  # success
 
-                    max_tokens=8000,
-                )
+                except Exception as e:
 
-                # Token usage
-                if response.usage:
+                    err = str(e).lower()
 
-                    llm_span.set_attribute(
-                        "llm.prompt_tokens",
-                        response.usage.prompt_tokens
-                    )
+                    # -----------------------------
+                    # prompt too long recovery
+                    # -----------------------------
+                    if "overlong" in err or "prompt" in err:
+                        agent_span.add_event("prompt_too_long_recovery")
 
-                    llm_span.set_attribute(
-                        "llm.completion_tokens",
-                        response.usage.completion_tokens
-                    )
+                        messages[:] = auto_compact(messages)
+                        continue
 
-                    llm_span.set_attribute(
-                        "llm.total_tokens",
-                        response.usage.total_tokens
-                    )
+                    # -----------------------------
+                    # network retry backoff
+                    # -----------------------------
+                    if attempt < MAX_RECOVERY_ATTEMPTS:
+                        delay = backoff_delay(attempt)
 
-                    llm_span.set_attribute("response", str(response.choices[0].message)[0:1000])
-                    
+                        agent_span.add_event(
+                            "retry",
+                            {"attempt": attempt, "delay": delay}
+                        )
+
+                        time.sleep(delay)
+                        continue
+
+                    raise
+
+            if response is None:
+                return
+
             assistant_message = response.choices[0].message
+            
+            print(response.choices[0].finish_reason)
+             
+            if response.choices[0].finish_reason == "length":
+                max_output_recovery_count += 1
 
-            # ----------------------------------------
-            # Append assistant message
-            # ----------------------------------------
+                if max_output_recovery_count <= MAX_RECOVERY_ATTEMPTS:
 
+                    agent_span.add_event("max_tokens_recovery")
+
+                    messages.append({
+                        "role": "user",
+                        "content": CONTINUATION_MESSAGE
+                    })
+                    agent_span.add_event(
+                        "max_tokens_recovery",
+                        {
+                            "message_preview": str(messages[-1])[:5000]
+                        }
+                    )
+
+                    continue
+
+                else:
+                    agent_span.add_event("max_tokens_exhausted")
+                    return
+
+            # -------------------------------------------------
+            # STORE ASSISTANT MESSAGE
+            # -------------------------------------------------
             messages.append({
                 "role": "assistant",
                 "content": assistant_message.content or "",
                 "tool_calls": assistant_message.tool_calls,
             })
 
-            tool_calls = assistant_message.tool_calls
+            # -------------------------------------------------
+            # STOP CONDITION (NO TOOL)
+            # -------------------------------------------------
+            if not assistant_message.tool_calls:
 
-            # ----------------------------------------
-            # Final response
-            # ----------------------------------------
-
-            if not tool_calls:
-
-                agent_span.set_attribute(
-                    "agent.finished",
-                    True
-                )
-
+                agent_span.set_attribute("agent.finished", True)
                 print(assistant_message.content)
                 return
 
-            manual_compact = False
-
-            # ----------------------------------------
-            # Execute tools
-            # ----------------------------------------
-
+            # =================================================
+            # TOOL EXECUTION PHASE (your original logic)
+            # =================================================
             tool_results = []
-            
-            for tool_call in tool_calls:
+
+            for tool_call in assistant_message.tool_calls:
 
                 tool_name = tool_call.function.name
-                agent_span.add_event(
-                    "tool_selected",
-                    {
-                        "tool.name": tool_name,
-                    }
-                )
+                args = json5.loads(tool_call.function.arguments)
 
-                args = json5.loads(
-                    tool_call.function.arguments
-                )
+                agent_span.add_event("tool_selected", {
+                    "tool.name": tool_name
+                })
+
                 ctx = {"tool_name": tool_name, "tool_input": args}
 
                 pre = hooks.run_hooks("PreToolUse", ctx)
-                
-                for m in pre.get("messages", []):
-                    tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": f"[Hook]: {m}",
-                    })
-                    
+
                 if pre.get("blocked"):
                     tool_results.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": f"Blocked: {pre.get('block_reason')}",
                     })
-                    return
-                with tracer.start_as_current_span(
-                    f"tool:{tool_name}"
-                ) as tool_span:
+                    continue
 
-                    tool_span.set_attribute(
-                        "tool.name",
-                        tool_name
-                    )
+                try:
+                    handler = TOOL_HANDLERS.get(tool_name)
+                    output = handler(**args) if handler else f"Unknown tool: {tool_name}"
 
-                    tool_span.set_attribute(
-                        "tool.args_preview",
-                        str(args)[:300]
-                    )
+                except Exception as e:
+                    output = f"Error: {e}"
 
-                    try:
+                ctx["tool_output"] = output
+                post = hooks.run_hooks("PostToolUse", ctx)
 
-                        if tool_name == "compact":
+                for m in post.get("messages", []):
+                    output += f"\n[Hook]: {m}"
 
-                            manual_compact = True
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": str(output),
+                })
 
-                            output = "Compressing..."
-                            
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": str(output),
-                            })
+                print(f"> {tool_name}: {str(output)[:200]}")
 
-                        else:
-
-                            handler = TOOL_HANDLERS.get(
-                                tool_name
-                            )
-
-                            output = (
-                                handler(**args)
-                                if handler
-                                else f"Unknown tool: {tool_name}"
-                            )
-
-                        tool_span.set_attribute(
-                            "tool.success",
-                            True
-                        )
-
-                    except Exception as e:
-
-                        output = f"Error: {e}"
-
-                        tool_span.record_exception(e)
-
-                        tool_span.set_attribute(
-                            "tool.success",
-                            False
-                        )
-
-                    tool_span.set_attribute(
-                        "tool.output_length",
-                        len(str(output))
-                    )
-                    ctx["tool_output"] = output
-                    post = hooks.run_hooks("PostToolUse", ctx)
-                    
-                    for m in post.get("messages", []):
-                        output += f"\n[Hook]: {m}"
-
-                    tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": str(output),
-                    })
-                    messages.extend(tool_results)
-
-
-                print(f"> {tool_name}:")
-                print(str(output)[:200])
+            messages.extend(tool_results)
 
                 
 

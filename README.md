@@ -58,5 +58,20 @@ mem里面的content和description区别是什么？
 Memory就是可以把用户的一些选择放在.memory目录下，一个option一个文件，最多load 200个文件。
 同时，这个很看LLM的情况。有些LLM配合的很困难
 
+s10 system prompt
+
+这节较简单但却很好，涉及怎么可以组织系统提示。这个其实最基本和优美的模式，方法组合：把core/memory/tools/skills等组合起来，再一起发给LLM.
+
+本章最大的收获是发现了Z-AI的模型，glm-5.1 ，一个拥有700 B的大模型，需要3个TB的显存运行。
+以及英伟达自己根据DS思路训练的120 B的模型，nemotron-3-super-120b-a12b，这两个目前看来都非常好用。
+Z-AI的polished效果尤其出色。
+
+s11 Error Recovery 
+
+这个也是基本的错误处理方式。不过作为agent代理，错误的处理要考虑重试/压缩/继续几种特有的情况。
+其实重试算不上特有，所有的分布式系统里面，timeout+重试都是基本的操作手段。但压缩确实是LLM交互中特有的。
+当token超出上限，提示LLM继续返回也是正常的。
+
+
 
 
