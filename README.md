@@ -49,12 +49,14 @@ s08 是讲的通过hooks来装配agents的功能，这个比较好，甚至可�
 在这组间隙，加了一下otel到jaeger和grafana的集成。感叹一下，现在观察工具真是贴心。
 引入jaeger的替手grafana/tempo
  
-s09
+s09 选项持久化
 
 User和feedback有什么区别？ // LLM不太分得出来
 mem里面的content和description区别是什么？
 都上传上去吗,欠缺search memory
  
+Memory就是可以把用户的一些选择放在.memory目录下，一个option一个文件，最多load 200个文件。
+同时，这个很看LLM的情况。有些LLM配合的很困难
 
 
 

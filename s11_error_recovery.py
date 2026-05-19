@@ -1,22 +1,18 @@
 # Harness: extensibility -- injecting behavior without touching the loop.
 """
-s10_system_prompt.py - System Prompt Construction
-This chapter teaches one core idea:
-the system prompt should be assembled from clear sections, not written as one
-giant hardcoded blob.
-Teaching pipeline:
-  1. core instructions
-  2. tool listing
-  3. skill metadata
-  4. memory section
-  5. CLAUDE.md chain
-  6. dynamic context
-The builder keeps stable information separate from information that changes
-often. A simple DYNAMIC_BOUNDARY marker makes that split visible.
-Per-turn reminders are even more dynamic. They are better injected as a
-separate user-role system reminder than mixed blindly into the stable prompt.
-Key insight: "Prompt construction is a pipeline with boundaries, not one
-big string."
+LLM call
+  |
+  +-- stop_reason == "max_tokens"
+  |      -> append continuation reminder
+  |      -> retry
+  |
+  +-- prompt too long
+  |      -> compact context
+  |      -> retry
+  |
+  +-- timeout / rate limit / connection error
+         -> back off
+         -> retry
 """
 
 import os
@@ -929,7 +925,7 @@ if __name__ == "__main__":
     )
     while True:
         try:
-            query = session.prompt("s10 >> ")
+            query = session.prompt("s11 >> ")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
