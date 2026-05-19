@@ -105,8 +105,23 @@ class TaskManager:
         return json.dumps(task, indent=2)
     def get(self, task_id: int) -> str:
         return json.dumps(self._load(task_id), indent=2)
+    
+    @classmethod
+    def ensure_list(cls, x):
+        if x is None:
+            return []
+        if isinstance(x, list):
+            return x
+        if isinstance(x, str):
+            return [x]
+        if isinstance(x, int):
+            return [str(x)]
+        return [str(x)]
+    
     def update(self, task_id: int, status: str = None, owner: str = None,
                add_blocked_by: list = None, add_blocks: list = None) -> str:
+        add_blocked_by = TaskManager.ensure_list(add_blocked_by)
+        add_blocks = TaskManager.ensure_list(add_blocks)
         task = self._load(task_id)
         if owner is not None:
             task["owner"] = owner
