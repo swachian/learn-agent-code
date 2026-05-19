@@ -837,7 +837,7 @@ def agent_loop(messages: list, hooks: HookManager):
                     agent_span.add_event(
                         "max_tokens_recovery",
                         {
-                            "message_preview": str(messages[-1])[:5000]
+                            "message_preview": str(messages[-2])[:5000]
                         }
                     )
 
