@@ -82,7 +82,9 @@ s13 Background Tasks
 对于系统开发人员而言，这是很常见的概念。不过AI交互最慢的地方其实是LLM,所以这个客户端异步的意义可能并不大。
 交互是基于线程和消息队列的模式。是否需要改成Async的呢？
 
+s14 Cron Schedule
 
+这个是加出来的一节，其核心设计理念就是在agent里面多开一个thread,该thread负责不停地check cron job,如发现生效，就把内容写入一个队列queue. 然后agent运行时，每个回合会去drain（非阻塞）一下这个队列，如果取到queue中的notification,就会作为一个message发给LLM,就像用户又输入了一条指示一样。
 
 
 
