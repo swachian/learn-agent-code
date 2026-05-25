@@ -1,34 +1,32 @@
 # Harness: extensibility -- injecting behavior without touching the loop.
 """
-s12_task_system.py - Tasks
-Tasks persist as JSON files in .tasks/ so they survive context compression.
-Each task carries a small dependency graph:
-- blockedBy: what must finish first
-- blocks: what this task unlocks later
-    .tasks/
-      task_1.json  {"id":1, "subject":"...", "status":"completed", ...}
-      task_2.json  {"id":2, "blockedBy":[1], "status":"pending", ...}
-      task_3.json  {"id":3, "blockedBy":[2], "blocks":[], ...}
-    Dependency resolution:
-    +----------+     +----------+     +----------+
-    | task 1   | --> | task 2   | --> | task 3   |
-    | complete |     | blocked  |     | blocked  |
-    +----------+     +----------+     +----------+
-         |                ^
-         +--- completing task 1 removes it from task 2's blockedBy
-Key idea: task state survives compression because it lives on disk, not only
-inside the conversation.
-These are durable work-graph tasks, not transient runtime execution slots.
+s19_mcp_plugin.py - MCP & Plugin System
+This teaching chapter focuses on the smallest useful idea:
+external processes can expose tools, and your agent can treat them like
+normal tools after a small amount of normalization.
+Minimal path:
+  1. start an MCP server process
+  2. ask it which tools it has
+  3. prefix and register those tools
+  4. route matching calls to that server
+Plugins add one more layer: discovery. A tiny manifest tells the agent which
+external server to start.
+Key insight: "External tools should enter the same tool pipeline, not form a
+completely separate world." In practice that means shared permission checks
+and normalized tool_result payloads.
 Read this file in this order:
-1. TaskManager: what a TaskRecord looks like on disk.
-2. TOOL_HANDLERS / TOOLS: how task operations enter the same loop as normal tools.
-3. agent_loop: how persistent work state is exposed back to the model.
+1. CapabilityPermissionGate: external tools still go through the same control gate.
+2. MCPClient: how one server connection exposes tool specs and tool calls.
+3. PluginLoader: how manifests declare external servers.
+4. MCPToolRouter / build_tool_pool: how native and external tools merge into one pool.
 Most common confusion:
-- a task record is a durable work item
-- it is not a thread, background slot, or worker process
+- a plugin manifest is not an MCP server
+- an MCP server is not a single MCP tool
+- external capability does not bypass the native permission path
 Teaching boundary:
-this chapter teaches the durable work graph first.
-Runtime execution slots and schedulers arrive later.
+this file teaches the smallest useful stdio MCP path.
+Marketplace details, auth flows, reconnect logic, and non-tool capability layers
+are intentionally left to bridge docs and later extensions.
 """
 
 import os
@@ -74,6 +72,45 @@ HOOK_TIMEOUT = 30  # seconds
 
 TRUST_MARKER = WORKDIR / ".claude" / ".claude_trusted"
 TASKS_DIR = WORKDIR / ".tasks"
+
+
+
+class PluginLoader:
+    """
+    Load plugins from .claude-plugin/ directories.
+    Teaching version implements the smallest useful plugin flow:
+    read a manifest, discover MCP server configs, and register them.
+    """
+    def __init__(self, search_dirs: list = None):
+        self.search_dirs = search_dirs or [WORKDIR]
+        self.plugins = {}  # name -> manifest
+    def scan(self) -> list:
+        """Scan directories for .claude-plugin/plugin.json manifests."""
+        found = []
+        for search_dir in self.search_dirs:
+            plugin_dir = Path(search_dir) / ".mcp"
+            manifest_path = plugin_dir / "plugin.json"
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text())
+                    name = manifest.get("name", plugin_dir.parent.name)
+                    self.plugins[name] = manifest
+                    found.append(name)
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"[Plugin] Failed to load {manifest_path}: {e}")
+        return found
+    def get_mcp_servers(self) -> dict:
+        """
+        Extract MCP server configs from loaded plugins.
+        Returns {server_name: {command, args, env}}.
+        """
+        servers = {}
+        for plugin_name, manifest in self.plugins.items():
+            for server_name, config in manifest.get("mcpServers", {}).items():
+                servers[f"{plugin_name}__{server_name}"] = config
+        return servers
+
+plugin_loader = PluginLoader()
 
 # -- TaskManager: CRUD for a persistent task graph --
 class TaskManager:
@@ -1085,13 +1122,260 @@ def agent_loop(messages: list, hooks: HookManager):
                 print(f"> {tool_name}:")
                 print(str(output)[:200])
 
+import os
+import subprocess
+import json
+from typing import Optional, List, Dict, Any
                 
+class MCPClient:
+    """
+    Minimal MCP client over stdio.
+    Fixed version - properly handles notifications (messages without id).
+    """
+    def __init__(self, server_name: str, command: str, args: list = None, env: dict = None):
+        self.server_name = server_name
+        self.command = command
+        self.args = args or []
+        self.env = {**os.environ, **(env or {})}
+        self.process = None
+        self._request_id = 0
+        self._tools = []  # cached tool list
+        
+    def connect(self):
+        """Start the MCP server process and complete handshake."""
+        try:
+            # 启动子进程
+            self.process = subprocess.Popen(
+                [self.command] + self.args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self.env,
+                text=True,
+                bufsize=1  # 行缓冲
+            )
+            
+            # Step 1: 发送 initialize 请求（这是请求，需要 id）
+            init_response = self._send_request("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "teaching-agent", "version": "1.0"},
+            })
+            
+            if not init_response or "error" in init_response:
+                error_msg = init_response.get("error", {}).get("message", "Unknown error") if init_response else "No response"
+                print(f"[MCP] Initialize failed: {error_msg}")
+                return False
+            
+            # Step 2: 发送 initialized 通知（这是通知，不能有 id）
+            self._send_notification("notifications/initialized")
+            
+            print(f"[MCP] Successfully connected to {self.server_name}")
+            return True
+            
+        except FileNotFoundError:
+            print(f"[MCP] Server command not found: {self.command}")
+        except Exception as e:
+            print(f"[MCP] Connection failed: {e}")
+        return False
+    
+    def list_tools(self) -> list:
+        """Fetch available tools from the server."""
+        response = self._send_request("tools/list", {})
+        if response and "result" in response:
+            self._tools = response["result"].get("tools", [])
+            print(f"[MCP] Loaded {len(self._tools)} tools from {self.server_name}")
+        return self._tools
+    
+    def call_tool(self, tool_name: str, arguments: dict) -> str:
+        """Execute a tool on the server."""
+        response = self._send_request("tools/call", {
+            "name": tool_name,
+            "arguments": arguments,
+        })
+        
+        if response and "result" in response:
+            content = response["result"].get("content", [])
+            return "\n".join(c.get("text", str(c)) for c in content)
+        if response and "error" in response:
+            return f"MCP Error: {response['error'].get('message', 'unknown')}"
+        return "MCP Error: no response"
+    
+    def get_agent_tools(self) -> list:
+        """
+        Convert MCP tools to agent tool format.
+        Uses prefix: mcp__{server_name}__{tool_name}
+        """
+        agent_tools = []
+        for tool in self._tools:
+            prefixed_name = f"mcp__{self.server_name}__{tool['name']}"
+            agent_tools.append({
+                "name": prefixed_name,
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("inputSchema", {
+                    "type": "object", 
+                    "properties": {}
+                }),
+                "_mcp_server": self.server_name,
+                "_mcp_tool": tool["name"],
+            })
+        return agent_tools
+    
+    def disconnect(self):
+        """Shut down the server process."""
+        if self.process:
+            try:
+                # 尝试优雅关闭
+                self._send_request("shutdown", {})
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                self.process.kill()
+            self.process = None
+            print(f"[MCP] Disconnected from {self.server_name}")
+    
+    def _send_request(self, method: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        发送 JSON-RPC 请求（带 id）
+        服务器必须回复对应的响应
+        """
+        if not self.process or self.process.poll() is not None:
+            return None
+        
+        self._request_id += 1
+        envelope = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": method,
+            "params": params
+        }
+        
+        return self._send_and_receive(envelope)
+    
+    def _send_notification(self, method: str, params: Dict[str, Any] = None):
+        """
+        发送 JSON-RPC 通知（不带 id）
+        服务器不会回复
+        """
+        if not self.process or self.process.poll() is not None:
+            return
+        
+        envelope = {
+            "jsonrpc": "2.0",
+            "method": method,
+        }
+        if params:
+            envelope["params"] = params
+        
+        # 通知不需要等待响应
+        line = json.dumps(envelope) + "\n"
+        try:
+            self.process.stdin.write(line)
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            print(f"[MCP] Failed to send notification: {e}")
+    
+    def _send_and_receive(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """发送消息并等待响应"""
+        line = json.dumps(message) + "\n"
+        try:
+            # 发送
+            self.process.stdin.write(line)
+            self.process.stdin.flush()
+            
+            # 接收响应
+            line = self.process.stdout.readline()
+            if line:
+                return json.loads(line)
+        except (BrokenPipeError, OSError, json.JSONDecodeError) as e:
+            print(f"[MCP] Communication error: {e}")
+        return None
 
+class MCPToolRouter:
+    """
+    Routes tool calls to the correct MCP server.
+    MCP tools are prefixed mcp__{server}__{tool} and live alongside
+    native tools in the same tool pool. The router strips the prefix
+    and dispatches to the right MCPClient.
+    """
+    def __init__(self):
+        self.clients = {}  # server_name -> MCPClient
+    def register_client(self, client: MCPClient):
+        self.clients[client.server_name] = client
+    def is_mcp_tool(self, tool_name: str) -> bool:
+        return tool_name.startswith("mcp__")
+    def call(self, tool_name: str, arguments: dict) -> str:
+        """Route an MCP tool call to the correct server."""
+        parts = tool_name.split("__", 2)
+        if len(parts) != 3:
+            return f"Error: Invalid MCP tool name: {tool_name}"
+        _, server_name, actual_tool = parts
+        client = self.clients.get(server_name)
+        if not client:
+            return f"Error: MCP server not found: {server_name}"
+        return client.call_tool(actual_tool, arguments)
+    def get_all_tools(self) -> list:
+        """Collect tools from all connected MCP servers."""
+        tools = []
+        for client in self.clients.values():
+            tools.extend(client.get_agent_tools())
+        return tools
+    
+mcp_router = MCPToolRouter()
 
+def build_tool_pool() -> list:
+    """
+    Build OpenAI-compatible tool pool:
+    - Merge native + MCP tools
+    - Avoid duplicate function names
+    - Native tools take precedence
+    """
 
+    all_tools = list(TOOLS)  # native tools (already OpenAI format)
+    mcp_tools = mcp_router.get_all_tools()
+
+    native_names = {
+        t["function"]["name"]
+        for t in all_tools
+        if "function" in t and "name" in t["function"]
+    }
+
+    for tool in mcp_tools:
+        # MCP tool → OpenAI tool format conversion
+        openai_tool = {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {
+                    "type": "object",
+                    "properties": {}
+                })
+            }
+        }
+
+        # skip conflict (native wins)
+        if openai_tool["function"]["name"] not in native_names:
+            all_tools.append(openai_tool)
+
+    return all_tools
 
 
 if __name__ == "__main__":
+    found = plugin_loader.scan()
+    if found:
+        print(f"[Plugins loaded: {', '.join(found)}]")
+        for server_name, config in plugin_loader.get_mcp_servers().items():
+            mcp_client = MCPClient(server_name, config.get("command", ""), config.get("args", []))
+            if mcp_client.connect():
+                mcp_client.list_tools()
+                mcp_router.register_client(mcp_client)
+                print(f"[MCP] Connected to {server_name}")
+
+    tool_count = len(build_tool_pool())
+    mcp_count = len(mcp_router.get_all_tools())
+    print(f"[Tool pool: {tool_count} tools ({mcp_count} from MCP)]")
+
     hooks = HookManager()
     # Fire SessionStart hooks
     hooks.run_hooks("SessionStart", {"tool_name": "", "tool_input": {}})
@@ -1113,7 +1397,7 @@ if __name__ == "__main__":
     )
     while True:
         try:
-            query = session.prompt("s12 >> ")
+            query = session.prompt("s19 >> ")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
