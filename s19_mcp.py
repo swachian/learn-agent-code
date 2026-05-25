@@ -1125,8 +1125,8 @@ def agent_loop(messages: list, hooks: HookManager):
 import os
 import subprocess
 import json
-from typing import Optional, List, Dict, Any
-                
+from typing import Any
+
 class MCPClient:
     """
     Minimal MCP client over stdio.
@@ -1141,7 +1141,7 @@ class MCPClient:
         self._request_id = 0
         self._tools = []  # cached tool list
         
-    def connect(self):
+    def connect(self) -> bool:
         """Start the MCP server process and complete handshake."""
         try:
             # 启动子进程
@@ -1221,7 +1221,7 @@ class MCPClient:
             })
         return agent_tools
     
-    def disconnect(self):
+    def disconnect(self) -> None:
         """Shut down the server process."""
         if self.process:
             try:
@@ -1234,7 +1234,7 @@ class MCPClient:
             self.process = None
             print(f"[MCP] Disconnected from {self.server_name}")
     
-    def _send_request(self, method: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _send_request(self, method: str, params: dict[str, Any]) -> dict[str, Any] | None:
         """
         发送 JSON-RPC 请求（带 id）
         服务器必须回复对应的响应
@@ -1252,7 +1252,7 @@ class MCPClient:
         
         return self._send_and_receive(envelope)
     
-    def _send_notification(self, method: str, params: Dict[str, Any] = None):
+    def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
         """
         发送 JSON-RPC 通知（不带 id）
         服务器不会回复
@@ -1275,7 +1275,7 @@ class MCPClient:
         except (BrokenPipeError, OSError) as e:
             print(f"[MCP] Failed to send notification: {e}")
     
-    def _send_and_receive(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _send_and_receive(self, message: dict[str, Any]) -> dict[str, Any] | None:
         """发送消息并等待响应"""
         line = json.dumps(message) + "\n"
         try:
