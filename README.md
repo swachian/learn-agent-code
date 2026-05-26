@@ -92,6 +92,20 @@ s15 Agent teams
 自己拉起多个代理，每个代理一个线程，分别执行不同的任务。并且可以在整个周期内保持活跃，甚至进行状态保存。
 通过.team/.inbox下面的文件进行交互，每个agent有一个同名的文件作为信箱。
 
+
+s18 Worktree Isolation
+
+思路是避免两个agent同时修改同一个文件引起冲突，把各自的修改房贷.worktree. 但具体怎么放呢？
+
+```
+git worktree add -b wt/feature-login \
+    /repo/.worktrees/feature-login \
+    HEAD
+```
+
+核心是利用了git的特性。和checkout不同，利用git worktree可以同时添加一个branch并把内容checkout到指定的目录，在此就是`.worktrees`搭配feature名称构成的目录名。这样就可以让两个agent在不同的.worktrees下面工作了。
+
+
 s19 MCP & Plugin
 
 本地的能力都叫Harness,但本例中基本都是自己手写的本地能力。而MCP允许你集成远端的或者标准的各种能力。
