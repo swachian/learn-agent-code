@@ -23,3 +23,6 @@ sample.py
 .data
 .agent_history
 output/**
+.team
+.inbox
+.mcp

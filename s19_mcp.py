@@ -45,6 +45,7 @@ from prompt_toolkit import prompt
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 import datetime
+import re
 
 load_dotenv(override=True)
 
@@ -107,7 +108,7 @@ class PluginLoader:
         servers = {}
         for plugin_name, manifest in self.plugins.items():
             for server_name, config in manifest.get("mcpServers", {}).items():
-                servers[f"{plugin_name}__{server_name}"] = config
+                servers[f"{server_name}"] = config
         return servers
 
 plugin_loader = PluginLoader()
@@ -484,10 +485,11 @@ class SystemPromptBuilder:
     # -- Section 1: Core instructions --
     def _build_core(self) -> str:
         return (
-            f"You are a coding agent operating in {self.workdir}.\n"
-            "Use the provided tools to explore, read, write, and edit files.\n"
-            "Always verify before assuming. Prefer reading files over guessing."
+            f"You are a coding agent at {self.workdir}. Use tools to solve tasks.\n"
+            "You have both native tools and MCP tools available.\n"
+            "MCP tools are prefixed with mcp__{server}__{tool}.\n"
         )
+        
     # -- Section 2: Tool listings --
     def _build_tool_listing(self) -> str:
         if not self.tools:
@@ -951,7 +953,7 @@ def agent_loop(messages: list, hooks: HookManager):
                         *messages
                     ],
 
-                    tools=TOOLS_SAFE,
+                    tools= build_tool_pool(), # TOOLS_SAFE,
 
                     tool_choice="auto",
 
@@ -1072,6 +1074,10 @@ def agent_loop(messages: list, hooks: HookManager):
                                 "tool_call_id": tool_call.id,
                                 "content": str(output),
                             })
+                        elif mcp_router.is_mcp_tool(tool_name):
+                            output = ( 
+                                mcp_router.call(tool_name, args)
+                            )
 
                         else:
 
@@ -1313,7 +1319,17 @@ class MCPToolRouter:
         client = self.clients.get(server_name)
         if not client:
             return f"Error: MCP server not found: {server_name}"
-        return client.call_tool(actual_tool, arguments)
+        with tracer.start_as_current_span("mcp.tool.call") as span:
+            span.set_attribute("mcp.tool.name", actual_tool)
+            span.set_attribute("mcp.server.name", server_name)
+            span.set_attribute("mcp.arguments", json.dumps(arguments, ensure_ascii=False))
+            out = client.call_tool(actual_tool, arguments)
+            
+            span.set_attribute("mcp.success", True)
+            span.set_attribute("mcp.result", str(out)[:2000])
+
+        return out
+    
     def get_all_tools(self) -> list:
         """Collect tools from all connected MCP servers."""
         tools = []
@@ -1323,6 +1339,9 @@ class MCPToolRouter:
     
 mcp_router = MCPToolRouter()
 
+
+from functools import lru_cache
+@lru_cache(maxsize=1)
 def build_tool_pool() -> list:
     """
     Build OpenAI-compatible tool pool:
@@ -1360,6 +1379,7 @@ def build_tool_pool() -> list:
 
     return all_tools
 
+import s_mcp_query
 
 if __name__ == "__main__":
     found = plugin_loader.scan()
@@ -1422,6 +1442,11 @@ if __name__ == "__main__":
             for line in prompt.splitlines():
                 if line.startswith("# ") or line == DYNAMIC_BOUNDARY:
                     print(f"  {line}")
+            continue
+        
+        mcp_re = re.compile(r'^/mcp')
+        if mcp_re.match(query.strip()):
+            s_mcp_query.mcp_query(query, mcp_router)
             continue
         
         history.append({"role": "user", "content": query})
