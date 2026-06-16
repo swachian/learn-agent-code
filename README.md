@@ -254,3 +254,5 @@ MCP Commands:
   /mcp search <keyword>  - Search tools by keyword
 
 ```
+
+worktree是git的一个特性，可以支持多个特性在不同的目录下并行开发。提交也可以考虑不同的目录，提交到对应的分支上。
