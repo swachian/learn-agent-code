@@ -103,7 +103,7 @@ def agent_loop(messages: list):
             args = eval(call.function.arguments)
 
             if func_name == "bash":
-                print(f"\033[33m$ {args['command']}\033[0m")
+                print(f"s01: \033[33m$ {args['command']}\033[0m")
                 output = run_bash(args["command"])
                 print(output[:-1])
 
