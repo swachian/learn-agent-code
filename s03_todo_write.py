@@ -68,7 +68,7 @@ class TodoManager:
             return "No todos."
         lines = []
         for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            marker = {"pending": "[...]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
             lines.append(f"{marker} #{item['id']}: {item['text']}")
         done = sum(1 for t in self.items if t["status"] == "completed")
         lines.append(f"\n({done}/{len(self.items)} completed)")
@@ -221,7 +221,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36ms03 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -237,3 +237,4 @@ if __name__ == "__main__":
 
 # test case:        
 # Refactor the file hello.py: add type hints, docstrings, and a main guard 
+

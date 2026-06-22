@@ -8,6 +8,9 @@ from pathlib import Path
 
 from openai import OpenAI
 from dotenv import load_dotenv
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+
 
 load_dotenv(override=True)
 
@@ -347,10 +350,13 @@ def agent_loop(messages: list) -> None:
 
 if __name__ == "__main__":
     history = []
-
+    session = PromptSession(
+        history=FileHistory(".agent_history")
+    )
+    
     while True:
         try:
-            query = input("\033[36ms05 >> \033[0m")
+            query = session.prompt("s05 >> ")
         except (EOFError, KeyboardInterrupt):
             break
 
