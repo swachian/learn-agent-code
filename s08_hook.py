@@ -112,6 +112,11 @@ class HookManager:
                     env["HOOK_TOOL_OUTPUT"] = str(
                         context["tool_output"])[:10000]
             try:
+                with tracer.start_as_current_span(
+                    f"hook_{command}"
+                ) as agent_span:
+                    agent_span.add_event(f"call hook {command}")
+
                 r = subprocess.run(
                     command, shell=True, cwd=WORKDIR, env=env,
                     capture_output=True, text=True, timeout=HOOK_TIMEOUT,

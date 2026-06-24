@@ -59,6 +59,7 @@ mem里面的content和description区别是什么？
  
 Memory就是可以把用户的一些选择放在.memory目录下，一个option一个文件，最多load 200个文件。
 同时，这个很看LLM的情况。有些LLM配合的很困难
+Nemotron可以较好地区分feedback和User.
 
 s10 system prompt
 
