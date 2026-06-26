@@ -1,0 +1,741 @@
+# ============================================
+# Flash Sale System - Kubernetes Deployments
+# ============================================
+
+---
+# 1. 命名空间
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flash-sale
+  labels:
+    app: flash-sale
+
+---
+# 2. ConfigMap - 应用配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flash-sale-config
+  namespace: flash-sale
+data:
+  REDIS_HOST: "redis-master.redis.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  TOTAL_STOCK: "10000"
+  STOCK_SHARDS: "100"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka.kafka.svc.cluster.local:9092"
+  KAFKA_TOPIC: "flash-sale-orders"
+  GLOBAL_QPS: "1000000"
+  USER_QPS: "100"
+  LOG_LEVEL: "INFO"
+
+---
+# 3. Secret - 敏感信息
+apiVersion: v1
+kind: Secret
+metadata:
+  name: flash-sale-secrets
+  namespace: flash-sale
+type: Opaque
+stringData:
+  DB_PASSWORD: "your-secure-password"
+  KAFKA_USERNAME: "kafka"
+  KAFKA_PASSWORD: "kafka-secret"
+
+---
+# 4. Redis Master Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-master
+  namespace: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+      role: master
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: master
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        command:
+        - redis-server
+        - --maxmemory 2gb
+        - --maxmemory-policy allkeys-lru
+        - --appendonly yes
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# 5. Redis Master Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: redis
+spec:
+  selector:
+    app: redis
+    role: master
+  ports:
+  - port: 6379
+    targetPort: 6379
+  clusterIP: None
+
+---
+# 6. Redis Replicas (读分离)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-replica
+  namespace: redis
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+      role: replica
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: replica
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        command:
+        - redis-server
+        - --replicaof redis-master.redis.svc.cluster.local 6379
+        - --maxmemory 2gb
+        - --maxmemory-policy allkeys-lru
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+---
+# 7. Redis Sentinel (高可用)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-sentinel
+  namespace: redis
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+      role: sentinel
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: sentinel
+    spec:
+      containers:
+      - name: sentinel
+        image: redis:7.2-alpine
+        command:
+        - redis-sentinel
+        - /usr/local/etc/redis/sentinel.conf
+        volumeMounts:
+        - name: config
+          mountPath: /usr/local/etc/redis
+      volumes:
+      - name: config
+        configMap:
+          name: redis-sentinel-config
+
+---
+# 8. ConfigMap - Redis Sentinel配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-sentinel-config
+  namespace: redis
+data:
+  sentinel.conf: |
+    port 26379
+    sentinel monitor mymaster redis-master 6379 2
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel parallel-syncs mymaster 1
+    sentinel failover-timeout mymaster 10000
+
+---
+# 9. Redis Cluster Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster
+  namespace: redis
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    name: redis
+  - port: 26379
+    name: sentinel
+
+---
+# 10. Flash Sale API Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flash-sale-api
+  namespace: flash-sale
+  labels:
+    app: flash-sale
+    component: api
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: flash-sale
+      component: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: flash-sale
+        component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # 亲和性: 分散到不同节点
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: component
+                  operator: In
+                  values:
+                  - api
+              topologyKey: kubernetes.io/hostname
+      
+      containers:
+      - name: api
+        image: flash-sale:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 9090
+          name: admin
+        
+        envFrom:
+        - configMapRef:
+            name: flash-sale-config
+        
+        env:
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: flash-sale-config
+              key: REDIS_HOST
+        
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 1Gi
+          limits:
+            cpu: 4000m
+            memory: 4Gi
+        
+        # 健康检查
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          successThreshold: 1
+        
+        # 优雅关闭
+        terminationGracePeriodSeconds: 30
+        
+        # 热点优化
+        env:
+        - name: PYTHONOPTIMIZE
+          value: "2"
+
+---
+# 11. Flash Sale API Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: flash-sale-api
+  namespace: flash-sale
+  labels:
+    app: flash-sale
+spec:
+  selector:
+    app: flash-sale
+    component: api
+  ports:
+  - port: 80
+    targetPort: 8000
+    name: http
+  - port: 9090
+    targetPort: 9090
+    name: admin
+  # 使用 Local LB 提高性能
+  externalTrafficPolicy: Local
+  sessionAffinity: ClientIP
+
+---
+# 12. Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: flash-sale-api-hpa
+  namespace: flash-sale
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: flash-sale-api
+  minReplicas: 10
+  maxReplicas: 100
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  # 扩容行为
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 10
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 10
+        periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 30
+
+---
+# 13. Kafka Cluster (使用Strimzi)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: kafka-cluster
+  namespace: kafka
+spec:
+  kafka:
+    version: 3.7.0
+    replicas: 6
+    resources:
+      requests:
+        cpu: 1000m
+        memory: 2Gi
+      limits:
+        cpu: 4000m
+        memory: 8Gi
+    listeners:
+    - name: plain
+      port: 9092
+      type: internal
+      tls: false
+    - name: tls
+      port: 9093
+      type: internal
+      tls: true
+    config:
+      # 分区数 (影响并发消费)
+      num.partitions: 100
+      # 副本数
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      # 性能优化
+      buffer.memory: 67108864
+      batch.size: 16384
+      linger.ms: 5
+      compression.type: snappy
+    storage:
+      type: persistent-claim
+      size: 50Gi
+      class: fast-storage
+    readinessProbe:
+      initialDelaySeconds: 15
+      periodSeconds: 10
+    livenessProbe:
+      initialDelaySeconds: 20
+      periodSeconds: 15
+  zookeeper:
+    replicas: 3
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    storage:
+      type: persistent-claim
+      size: 10Gi
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    userOperator:
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+---
+# 14. Kafka Topic
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: flash-sale-orders
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  partitions: 100
+  replicas: 3
+  config:
+    retention.ms: 604800000  # 7天
+    cleanup.policy: delete
+    max.message.bytes: 1048576
+
+---
+# 15. Kafka Consumer Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flash-sale-consumer
+  namespace: flash-sale
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: flash-sale
+      component: consumer
+  template:
+    metadata:
+      labels:
+        app: flash-sale
+        component: consumer
+    spec:
+      containers:
+      - name: consumer
+        image: flash-sale-consumer:latest
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: flash-sale-config
+        env:
+        - name: DB_HOST
+          value: "postgresql.postgres.svc.cluster.local"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: flash-sale-secrets
+              key: DB_PASSWORD
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+
+---
+# 16. Consumer Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: flash-sale-consumer
+  namespace: flash-sale
+spec:
+  clusterIP: None
+  selector:
+    app: flash-sale
+    component: consumer
+
+---
+# 17. Consumer HPA
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: flash-sale-consumer-hpa
+  namespace: flash-sale
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: flash-sale-consumer
+  minReplicas: 5
+  maxReplicas: 20
+  metrics:
+  - type: External
+    external:
+      metric:
+        name: kafka_consumer_lag
+        selector:
+          matchLabels:
+            topic: flash-sale-orders
+      target:
+        type: AverageValue
+        averageValue: "1000"
+
+---
+# 18. Ingress (Nginx)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flash-sale-ingress
+  namespace: flash-sale
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$request_uri"
+    nginx.ingress.kubernetes.io/limit-rps: "100000"
+    nginx.ingress.kubernetes.io/limit-connections: "10000"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: flash-sale.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: flash-sale-api
+            port:
+              number: 80
+  # TLS配置 (可选)
+  # tls:
+  # - hosts:
+  #   - flash-sale.example.com
+  #   secretName: flash-sale-tls
+
+---
+# 19. IngressClass (Nginx)
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: k8s.io/ingress-nginx
+
+---
+# 20. NetworkPolicy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flash-sale-network-policy
+  namespace: flash-sale
+spec:
+  podSelector:
+    matchLabels:
+      app: flash-sale
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: nginx-ingress
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kafka
+    ports:
+    - protocol: TCP
+      port: 9092
+
+---
+# 21. PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: flash-sale-api-pdb
+  namespace: flash-sale
+spec:
+  minAvailable: 8
+  selector:
+    matchLabels:
+      app: flash-sale
+      component: api
+
+---
+# 22. Prometheus ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: flash-sale-monitor
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: flash-sale
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics
+  namespaceSelector:
+    matchNames:
+    - flash-sale
+
+---
+# 23. Prometheus PodMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: flash-sale-api-pod-monitor
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: flash-sale
+      component: api
+  podMetricsEndpoints:
+  - port: metrics
+    interval: 15s
+  namespaceSelector:
+    matchNames:
+    - flash-sale
+
+---
+# 24. Grafana Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flash-sale-grafana-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  flash-sale.json: |
+    {
+      "dashboard": {
+        "title": "Flash Sale Dashboard",
+        "panels": [
+          {
+            "title": "QPS",
+            "targets": [
+              {
+                "expr": "sum(rate(flash_sale_requests_total[1m]))"
+              }
+            ]
+          },
+          {
+            "title": "Success Rate",
+            "targets": [
+              {
+                "expr": "sum(rate(flash_sale_success_total[1m])) / sum(rate(flash_sale_requests_total[1m]))"
+              }
+            ]
+          },
+          {
+            "title": "P99 Latency",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, rate(flash_sale_request_duration_seconds_bucket[5m]))"
+              }
+            ]
+          },
+          {
+            "title": "Stock Remaining",
+            "targets": [
+              {
+                "expr": "flash_sale_stock_current"
+              }
+            ]
+          }
+        ]
+      }
+    }

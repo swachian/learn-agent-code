@@ -1,0 +1,50 @@
+# Kustomization for Flash Sale System
+# Usage: kubectl apply -k k8s/overlays/production
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: flash-sale
+
+resources:
+  - ../../flash-sale.yaml
+
+commonLabels:
+  app.kubernetes.io/name: flash-sale
+  app.kubernetes.io/part-of: flash-sale-system
+
+images:
+  - name: flash-sale:latest
+    newName: your-registry.example.com/flash-sale-api
+    newTag: v1.0.0
+  - name: flash-sale-consumer:latest
+    newName: your-registry.example.com/flash-sale-consumer
+    newTag: v1.0.0
+
+replicas:
+  - name: flash-sale-api
+    count: 20
+
+configMapGenerator:
+  - name: flash-sale-config
+    envs:
+      - config.env
+
+secretGenerator:
+  - name: flash-sale-secrets
+    envs:
+      - secrets.env
+    type: Opaque
+
+patchesStrategicMerge:
+  - patches/ingress.yaml
+  - patches/hpa.yaml
+
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: "8000m"
+    target:
+      kind: Deployment
+      name: flash-sale-api
