@@ -1,0 +1,32 @@
+{
+  "worktrees": [
+    {
+      "name": "auth-refactor",
+      "path": "/home/zhangyu/github/learn-agent-code/.worktrees/auth-refactor",
+      "branch": "wt/auth-refactor",
+      "task_id": null,
+      "status": "removed",
+      "created_at": 1779803090.1382825,
+      "removed_at": 1779808271.1317966,
+      "closeout": {
+        "action": "remove",
+        "reason": "",
+        "at": 1779808271.1317968
+      }
+    },
+    {
+      "name": "ui-login",
+      "path": "/home/zhangyu/github/learn-agent-code/.worktrees/ui-login",
+      "branch": "wt/ui-login",
+      "task_id": null,
+      "status": "kept",
+      "created_at": 1779803153.8096128,
+      "kept_at": 1779808142.5317516,
+      "closeout": {
+        "action": "keep",
+        "reason": "",
+        "at": 1779808142.5317516
+      }
+    }
+  ]
+}

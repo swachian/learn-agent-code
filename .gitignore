@@ -28,3 +28,5 @@ output/**
 .mcp
 .trees
 resume-agent
+
+.runtime/*

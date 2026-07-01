@@ -1,0 +1,9 @@
+{"event": "worktree.create.before", "ts": 1779803090.0990314, "worktree": "auth-refactor"}
+{"event": "worktree.create.after", "ts": 1779803090.1384473, "worktree": "auth-refactor"}
+{"event": "worktree.create.before", "ts": 1779803153.7716103, "worktree": "ui-login"}
+{"event": "worktree.create.after", "ts": 1779803153.8097808, "worktree": "ui-login"}
+{"event": "worktree.keep", "ts": 1779808142.5318959, "worktree": "ui-login"}
+{"event": "worktree.remove.before", "ts": 1779808271.1242425, "worktree": "auth-refactor"}
+{"event": "worktree.remove.after", "ts": 1779808271.1319687, "worktree": "auth-refactor"}
+{"event": "worktree.remove.before", "ts": 1779808448.6670234, "worktree": "auth-refactor"}
+{"event": "worktree.remove.failed", "ts": 1779808448.668676, "worktree": "auth-refactor", "error": "fatal: '/home/zhangyu/github/learn-agent-code/.worktrees/auth-refactor' is not a working tree"}

@@ -1,0 +1,10 @@
+{
+  "id": "5db1e8ed",
+  "status": "completed",
+  "result": "后台任务1开始\n后台任务1完成",
+  "command": "echo \"后台任务1开始\" && sleep 3 && echo \"后台任务1完成\"",
+  "started_at": 1782473960.6967716,
+  "finished_at": 1782473963.7001078,
+  "result_preview": "后台任务1开始 后台任务1完成",
+  "output_file": ".runtime-tasks/5db1e8ed.log"
+}

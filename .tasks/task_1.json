@@ -1,9 +1,13 @@
 {
   "id": 1,
-  "subject": "Setup a fastapi project under directory ttt",
-  "description": "",
+  "subject": "Backend authentication system",
+  "description": "Implement authentication endpoints, JWT token handling, password hashing, and user management for the backend.",
   "status": "completed",
   "blockedBy": [],
   "blocks": [],
-  "owner": ""
+  "owner": "agent",
+  "worktree": "auth-refactor",
+  "last_worktree": "auth-refactor",
+  "worktree_state": "active",
+  "updated_at": 1779803109.86294
 }

@@ -1,24 +1,20 @@
-This project comes from https://learn.shareai.run/zh/s02/, which is about an agent on LLM. The origin project is based on Anthropic apis. Although the same api style can be used through other platforms like Kimi/anthropic, they all need changing. As I only want to learn and observe, I don't intend to pay the bills. Fortunately, Nvidia provide such a platform with loads of open source LLMs, https://integrate.api.nvidia.com/v1. Most important, LLMs on Nvidia platform are free, at least currently. Nvidia is elegant, so they don't provide anthropic apis now. Callings to Anthropic apis must be converted OpenAI style. It's a snack to AI. 
+本项目来自 https://learn.shareai.run/zh/s02/，是一个关于大语言模型（LLM）智能体的教程。原始项目基于 Anthropic 的 API。虽然也可以通过 Kimi 等其他平台使用相同风格的 API，但都需要进行修改。幸运的是，Nvidia 提供了一个平台，上面有大量开源的 LLM：https://integrate.api.nvidia.com/v1，而且目前是免费的。但当前并不提供 Anthropic 风格的 API。调用 Anthropic 的 API 必须转换为 OpenAI 风格。这对 AI 来说是小菜一碟。
 
-In s01, an agent is built. 
+在 s01 中，构建了一个智能体。
 
-s02, change the tools.
+s02 中，修改了工具（tools）。
 
-
-| Anthropic 风格   | OpenAI / NIM 风格        |
-| -------------- | ---------------------- |
-| `name`         | `function.name`        |
+| Anthropic 风格 | OpenAI / NIM 风格 |
+| -------------- | ----------------- |
+| `name`         | `function.name` |
 | `description`  | `function.description` |
-| `input_schema` | `function.parameters`  |
-| 无              | `"type": "function"`   |
+| `input_schema` | `function.parameters` |
+| 无 | `"type": "function"` |
 
+该智能体配备了 4 个工具——除了 s01 中的 bash 工具外，还有 3 个用于读/写/编辑文件的工具。在使用 Kimi 时，她似乎总是倾向于使用 bash 工具。我必须非常注意措辞，才能让她使用“正确”的工具。后来换成了阿里的通义千问（Qwen），它的行为完全符合教程对 Anthropic 的预期。Qwen 看起来更像 Anthropic。
 
-The agent is given 4 tools—besides s01's bash, there are also 3 tools for reading/writing/editing files. With Kimi, she always seems to lean towards using bash. I have to be very careful with my wording to get her to use the 'correct' tool. Switched to Alibaba's Qwen, and it behaves exactly like the tutorial expected from Anthropic. Qwen looks more akin to Anthropic."
-
-
-s03. 
-A todo manager is added as a new tool. However, the most important thing is to change the description in `System`. You need tell the SYSTEM that she has to plan firstly, and then it can do the tasks one by one.
-
+s03 中，
+添加了一个待办事项管理器（todo manager）作为新工具。但最重要的是修改 `System` 提示词中的描述。你需要告诉 SYSTEM，她必须首先制定计划，然后才能逐一执行任务。
 ```
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
@@ -95,6 +91,9 @@ s15 Agent teams
 自己拉起多个代理，每个代理一个线程，分别执行不同的任务。并且可以在整个周期内保持活跃，甚至进行状态保存。
 通过.team/.inbox下面的文件进行交互，每个agent有一个同名的文件作为信箱。
 
+send的时候是只往inbox文件后面append.  
+用inbox_path.write_text("") 清空inbox.这个例子没有处理并发的情况。如果要并发，可能需要加上一把锁。考虑到并发量只是本机的代理，一把所有team共用的排它锁就足够了。
+
 
 s18 Worktree Isolation
 
@@ -108,6 +107,7 @@ git worktree add -b wt/feature-login \
 
 核心是利用了git的特性。和checkout不同，利用git worktree可以同时添加一个branch并把内容checkout到指定的目录，在此就是`.worktrees`搭配feature名称构成的目录名。这样就可以让两个agent在不同的.worktrees下面工作了。
 
+worktree是git的一个特性，可以支持多个特性在不同的目录下并行开发。提交也可以考虑不同的目录，提交到对应的分支上。
 
 s19 MCP & Plugin
 
@@ -187,7 +187,34 @@ git_tool的某个功能
 }
 ```
 
+plugin和agent的通信是一种进程间通信。用npx或uvx启动一个本地的胶水进程，如何启动由plugin的配置文件告诉agent.然后通过stdinout在后续发命令。
 执行命令的时候，agent象rpc一样，把命令和参数传递给mcp启动的subprocess.然后再从取得的结果中对内容进行分析。
+消息格式是复用的json-rpc
+
+```
+Agent stdin
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{...}}
+
+```
+然后，胶水层也就是本地的进程会发实际的请求比如http等到search的远端，再把内容包装返回。
+
+```
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "..."
+      }
+    ]
+  }
+}
+```
 
 ```
     "web-search": {
@@ -257,5 +284,6 @@ MCP Commands:
   /mcp search <keyword>  - Search tools by keyword
 
 ```
+通过问题，比对llm的基础能力。外部知识库统一使用web search。
 
-worktree是git的一个特性，可以支持多个特性在不同的目录下并行开发。提交也可以考虑不同的目录，提交到对应的分支上。
+

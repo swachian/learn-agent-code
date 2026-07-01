@@ -1,9 +1,13 @@
 {
   "id": 2,
-  "subject": "Write code for ttt",
-  "description": "",
-  "status": "completed",
+  "subject": "Frontend login page",
+  "description": "Create a login page with form validation, integration with backend auth API, and routing.",
+  "status": "in_progress",
   "blockedBy": [],
   "blocks": [],
-  "owner": ""
+  "owner": "agent",
+  "worktree": "ui-login",
+  "last_worktree": "ui-login",
+  "worktree_state": "active",
+  "updated_at": 1779803159.7326324
 }
